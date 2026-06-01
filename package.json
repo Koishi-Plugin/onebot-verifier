@@ -2,21 +2,34 @@
   "name": "koishi-plugin-onebot-verifier",
   "description": "适用于 Onebot 的审核插件，支持自动审核好友/加群/邀请请求",
   "version": "0.0.1",
+  "contributors": [
+    "Yis_Rime <yis_rime@outlook.com>"
+  ],
+  "homepage": "https://github.com/Koishi-Plugin/onebot-verifier",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Koishi-Plugin/onebot-verifier.git"
+  },
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
     "lib",
     "dist"
   ],
-  "license": "MIT",
-  "scripts": {},
+  "license": "AGPL-3.0-only",
   "keywords": [
     "chatbot",
     "koishi",
-    "plugin"
+    "plugin",
+    "onebot",
+    "verifier",
+    "group",
+    "user"
   ],
-  "devDependencies": {},
+  "devDependencies": {
+    "koishi-plugin-adapter-onebot": "^6.1.3"
+  },
   "peerDependencies": {
-    "koishi": "^4.18.7"
+    "koishi": "^4.18.3"
   }
 }
