@@ -15,170 +15,179 @@ export const usage = `
 </div>
 `
 
-type RequestKind = 'friend' | 'guild' | 'member'
+type RequestType = 'friend' | 'guild' | 'member'
 
-interface UserInfo {
+interface UserStats {
   user_id: number
   qqLevel?: number
 }
 
-interface GroupInfo {
+interface GroupStats {
   group_id: number
   group_name: string
   member_count: number
   max_member_count: number
 }
 
-interface Task {
+interface VerifyTask {
   session: Session;
-  kind: RequestKind;
+  kind: RequestType;
   messages: string[];
   timer?: NodeJS.Timeout;
 }
 
 export interface Config {
-  enable?: boolean
   notifyTarget?: string
-  enableDebug?: boolean
-  FriendLevel?: number
-  FriendRequestAutoRegex?: string
-  MemberRequestAutoRules?: { guildId: string; keyword: string; minLevel: number }[]
-  GuildAllowUsers?: string[]
-  GuildMinMemberCount?: number
-  GuildMaxCapacity?: number
-  manualTimeout?: number
-  manualTimeoutAction?: 'accept' | 'reject'
+  notifyAuto?: boolean
+  debugMode?: boolean
+  timeout?: number
+  timeoutAction?: 'accept' | 'reject'
+  friendLevel?: number
+  friendRegex?: string
+  minMembers?: number
+  maxCapacity?: number
+  verifyMode?: 'strict' | 'assist' | 'manual'
+  verifyRules?: {
+    guildId: string;
+    keyword?: string;
+    minLevel?: number;
+    groupAction?: 'accept' | 'reject'
+  }[]
 }
 
-export const Config: Schema<Config> = Schema.object({
-  enable: Schema.boolean().description('开启请求监听').default(true),
-  notifyTarget: Schema.string().description('通知目标(guild/private:number)').required(),
-  enableDebug: Schema.boolean().description('开启调试日志').default(false),
-  manualTimeout: Schema.number().description('请求超时时长').default(360).min(0),
-  manualTimeoutAction: Schema.union([
-    Schema.const('accept').description('同意'),
-    Schema.const('reject').description('拒绝'),
-  ]).description('默认超时操作').default('accept'),
-  FriendLevel: Schema.number().description('最低好友等级').default(-1).min(-1).max(256),
-  GuildMinMemberCount: Schema.number().description('最低群成员数').default(-1).min(-1).max(3000),
-  GuildMaxCapacity: Schema.number().description('最低受邀容量').default(-1).min(-1).max(3000),
-  FriendRequestAutoRegex: Schema.string().description('好友验证正则'),
-  MemberRequestAutoRules: Schema.array(Schema.object({
-    guildId: Schema.string().description('群号'),
-    keyword: Schema.string().description('正则'),
-    minLevel: Schema.number().description('等级').default(-1),
-  })).description('加群验证规则').role('table'),
-  GuildAllowUsers: Schema.array(String).description('邀请加群白名单').role('table'),
-}).description('请求处理配置')
+export const Config: Schema<Config> = Schema.intersect([
+  Schema.object({
+    notifyTarget: Schema.string().description('通知目标(guild/private:number)').required(),
+    notifyAuto: Schema.boolean().description('发送全部通知').default(true),
+    debugMode: Schema.boolean().description('输出调试日志').default(false),
+  }).description('基础配置'),
+  Schema.object({
+    timeout: Schema.number().description('请求超时时长').default(360).min(0),
+    timeoutAction: Schema.union([
+      Schema.const('accept').description('同意'),
+      Schema.const('reject').description('拒绝'),
+    ]).description('默认超时操作').default('accept'),
+    friendLevel: Schema.number().description('最低好友等级').default(-1).min(-1).max(256),
+    friendRegex: Schema.string().description('好友验证正则'),
+    minMembers: Schema.number().description('最低群成员数').default(-1).min(-1).max(3000),
+    maxCapacity: Schema.number().description('最低受邀容量').default(-1).min(-1).max(3000),
+  }).description('好友邀群配置'),
+  Schema.object({
+    verifyMode: Schema.union([
+      Schema.const('strict').description('规则'),
+      Schema.const('assist').description('超时'),
+      Schema.const('manual').description('手动'),
+    ]).description('处理模式').default('assist'),
+    verifyRules: Schema.array(Schema.object({
+      guildId: Schema.string().description('群号').required(),
+      keyword: Schema.string().description('正则'),
+      minLevel: Schema.number().description('等级').default(-1),
+      groupAction: Schema.union([
+        Schema.const('accept').description('同意'),
+        Schema.const('reject').description('拒绝'),
+      ]).description('操作'),
+    })).description('加群验证配置').role('table'),
+  }).description('加群请求配置')
+])
 
 export function apply(ctx: Context, config: Config = {}) {
   const logger = new Logger('onebot-verifier');
-  const tasks = new Map<string, Task>();
+  const activeTasks = new Map<string, VerifyTask>();
 
-  // 执行操作
-  const doAction = async (session: Session, kind: RequestKind, pass: boolean, reason = '', remark = ''): Promise<boolean> => {
+  const executeAction = async (session: Session, kind: RequestType, pass: boolean, reason = '', remark = ''): Promise<boolean> => {
     try {
-      const data = session.event?._data || {};
-      if (!pass && kind === 'guild' && session.guildId && (session.event?.type === 'guild-added' || data.notice_type === 'group_increase')) {
+      const eventData = session.event?._data || {};
+      if (!pass && kind === 'guild' && session.guildId && (session.event?.type === 'guild-added' || eventData.notice_type === 'group_increase')) {
         if (reason) {
-          try { await session.bot.sendMessage(session.guildId, `将退出该群：${reason}`); }
-          catch (error) { logger.warn(`发送提醒失败: ${error}`); }
+          try { await session.bot.sendMessage(session.guildId, `${reason}，将退出该群`); }
+          catch (error) { logger.warn(`发送退群通知失败: ${error}`); }
         }
-        try {
-          await session.onebot?.setGroupLeave(session.guildId, false);
-          return true;
-        } catch (error) { logger.error(`退出群组 ${session.guildId} 失败: ${error}`); return false; }
+        await session.onebot?.setGroupLeave(session.guildId, false);
+        return true;
       }
-      if (!data.flag || !session.onebot) return false;
-      if (kind === 'friend') await session.onebot.setFriendAddRequest(data.flag, pass, remark);
-      else await session.onebot.setGroupAddRequest(data.flag, data.sub_type ?? 'add', pass, pass ? '' : reason);
+      if (!eventData.flag || !session.onebot) return false;
+      if (kind === 'friend') await session.onebot.setFriendAddRequest(eventData.flag, pass, remark);
+      else await session.onebot.setGroupAddRequest(eventData.flag, eventData.sub_type ?? 'add', pass, pass ? '' : reason);
       return true;
     } catch (error) {
-      logger.error(`请求操作失败: ${error}`);
+      logger.error(`操作失败: ${error}`);
       return false;
     }
   };
 
-  // 发送通知
-  const notify = async (session: Session, kind: RequestKind): Promise<string[]> => {
-    const target = config.notifyTarget || '';
-    if (!target) return [];
-    const [type, id] = target.split(':');
-    if (!id || (type !== 'guild' && type !== 'private')) return [];
+  const sendNotice = async (session: Session, kind: RequestType, status: 'auto_pass' | 'auto_reject' | 'waiting' = 'waiting'): Promise<string[]> => {
+    const notifyConfig = config.notifyTarget || '';
+    if (!notifyConfig) return [];
+    const [targetType, targetId] = notifyConfig.split(':');
+    if (!targetId || (targetType !== 'guild' && targetType !== 'private')) return [];
+    if (status !== 'waiting' && !config.notifyAuto) return [];
     try {
-      const data = session.event?._data || {};
-      const user = session.userId ? await session.bot.getUser?.(session.userId)?.catch(() => null) : null;
-      const guild = (kind !== 'friend' && session.guildId) ? await session.bot.getGuild?.(session.guildId)?.catch(() => null) : null;
-      const admin = data.operator_id && session.userId && data.operator_id.toString() !== session.userId
-        ? await session.bot.getUser?.(data.operator_id.toString())?.catch(() => null) : null;
-
-      const lines = [];
-      if (user?.avatar) lines.push(`<image url="${user.avatar}"/>`);
+      const eventData = session.event?._data || {};
+      const userInfo = session.userId ? await session.bot.getUser?.(session.userId)?.catch(() => null) : null;
+      const groupInfo = (kind !== 'friend' && session.guildId) ? await session.bot.getGuild?.(session.guildId)?.catch(() => null) : null;
+      const adminInfo = eventData.operator_id && session.userId && eventData.operator_id !== session.userId
+        ? await session.bot.getUser?.(eventData.operator_id)?.catch(() => null) : null;
+      const infoLines = [];
+      if (userInfo?.avatar) infoLines.push(`<image url="${userInfo.avatar}"/>`);
       const typeName = kind === 'friend' ? '好友申请' : kind === 'member' ? '加群请求' : '群组邀请';
-      lines.push(`类型：${typeName}`);
-      if (kind !== 'guild' || session.userId !== session.selfId) lines.push(`用户：${user?.name || session.userId}${session.userId ? `(${session.userId})` : ''}`);
-      if (admin) lines.push(`管理：${admin.name ? `${admin.name}(${data.operator_id})` : data.operator_id}`);
-      if (guild) lines.push(`群组：${guild.name ? `${guild.name}(${session.guildId})` : session.guildId}`);
-      if (data.comment) lines.push(`验证信息：${data.comment}`);
-
-      const text = lines.join('\n');
-      return await (type === 'private' ? session.bot.sendPrivateMessage(id, text) : session.bot.sendMessage(id, text)) || [];
+      const statusText = status === 'auto_pass' ? '[自动通过]' : status === 'auto_reject' ? '[自动拒绝]' : '[等待处理]';
+      infoLines.push(`类型：${typeName} ${statusText}`);
+      if (kind !== 'guild' || session.userId !== session.selfId) infoLines.push(`用户：${userInfo?.name || session.userId}${session.userId ? `(${session.userId})` : ''}`);
+      if (adminInfo) infoLines.push(`管理：${adminInfo.name ? `${adminInfo.name}(${eventData.operator_id})` : eventData.operator_id}`);
+      if (groupInfo) infoLines.push(`群组：${groupInfo.name ? `${groupInfo.name}(${session.guildId})` : session.guildId}`);
+      if (eventData.comment) infoLines.push(`验证信息：${eventData.comment}`);
+      const content = infoLines.join('\n');
+      return await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, content) : session.bot.sendMessage(targetId, content)) || [];
     } catch (error) {
-      logger.error(`发送通知失败: ${error}`);
+      logger.error(`通知失败: ${error}`);
       return [];
     }
   };
 
-  // 自动处理
-  const checkAuto = async (session: Session, kind: RequestKind): Promise<boolean | string> => {
-    const raw = session.event?._data?.comment || '';
-    const lines = raw.split(/[\r\n]+/)
-      .map((s: string) => s.trim())
-      .filter((s: string) => /^(回答)[:：]/i.test(s))
-      .map((s: string) => s.replace(/^(回答)[:：]\s*/i, ''));
-    const answer = lines.length > 0 ? lines.join('\n') : raw;
-
-    const makeRegex = (text: string) => {
+  const checkCriteria = async (session: Session, kind: RequestType): Promise<boolean | string> => {
+    const rawText = session.event?._data?.comment || '';
+    const cleanLines = rawText.split(/[\r\n]+/)
+      .map((s: string) => s.trim()).filter((s: string) => /^(回答)[:：]/i.test(s)).map((s: string) => s.replace(/^(回答)[:：]\s*/i, ''));
+    const verifyText = cleanLines.length > 0 ? cleanLines.join('\n') : rawText;
+    const toRegex = (text: string) => {
       const match = text.match(/^\/(.+)\/([a-z]*)$/);
       return match ? new RegExp(match[1], match[2]) : new RegExp(text, 'i');
     };
-
     if (kind === 'member') {
-      const rule = config.MemberRequestAutoRules?.find(rule => rule.guildId === session.guildId);
-      if (!rule) return false;
+      const groupRule = config.verifyRules?.find(r => r.guildId === session.guildId);
+      if (!groupRule) return false;
       try {
-        if (rule.keyword && !makeRegex(rule.keyword).test(answer)) return false;
-        if ((rule.minLevel ?? -1) >= 0 && session.onebot && session.userId) {
-          const info = await session.onebot.getStrangerInfo(session.userId, true) as UserInfo;
-          if ((info.qqLevel ?? 0) < rule.minLevel) return `QQ 等级低于${rule.minLevel}级`;
+        if (groupRule.keyword && !toRegex(groupRule.keyword).test(verifyText)) return false;
+        const limitLevel = groupRule.minLevel ?? -1;
+        if (limitLevel >= 0 && session.onebot && session.userId) {
+          const stats = await session.onebot.getStrangerInfo(session.userId, true) as UserStats;
+          if ((stats.qqLevel ?? 0) < limitLevel) return `QQ 等级低于 ${limitLevel} 级`;
         }
       } catch { return false; }
       return true;
     }
-
     if (kind === 'friend') {
       try {
-        if (config.FriendRequestAutoRegex && makeRegex(config.FriendRequestAutoRegex).test(answer)) return true;
-        if ((config.FriendLevel ?? -1) >= 0 && session.onebot && session.userId) {
-          const info = await session.onebot.getStrangerInfo(session.userId, true) as UserInfo;
-          if ((info.qqLevel ?? 0) < config.FriendLevel!) return `QQ 等级低于${config.FriendLevel}级`;
+        if (config.friendRegex && toRegex(config.friendRegex).test(verifyText)) return true;
+        const limitLevel = config.friendLevel ?? -1;
+        if (limitLevel >= 0 && session.onebot && session.userId) {
+          const stats = await session.onebot.getStrangerInfo(session.userId, true) as UserStats;
+          if ((stats.qqLevel ?? 0) < limitLevel) return `QQ 等级低于 ${limitLevel} 级`;
           return true;
         }
       } catch { return false; }
       return false;
     }
-
     if (kind === 'guild') {
-      if (session.userId && config.GuildAllowUsers?.includes(session.userId)) return true;
       try {
-        const user = session.userId ? await ctx.database.getUser(session.platform, session.userId) : null;
-        if (user && user.authority > 1) return true;
+        const userData = session.userId ? await ctx.database.getUser(session.platform, session.userId) : null;
+        if (userData && userData.authority > 1) return true;
       } catch {}
-      if (session.onebot && session.guildId && ((config.GuildMinMemberCount ?? -1) >= 0 || (config.GuildMaxCapacity ?? -1) >= 0)) {
+      if (session.onebot && session.guildId && ((config.minMembers ?? -1) >= 0 || (config.maxCapacity ?? -1) >= 0)) {
         try {
-          const info = await session.onebot.getGroupInfo(session.guildId, true) as GroupInfo;
-          if (config.GuildMinMemberCount! >= 0 && info.member_count < config.GuildMinMemberCount!) return `群成员不足${config.GuildMinMemberCount}人`;
-          if (config.GuildMaxCapacity! >= 0 && info.max_member_count < config.GuildMaxCapacity!) return `群容量不足${config.GuildMaxCapacity}人`;
+          const stats = await session.onebot.getGroupInfo(session.guildId, true) as GroupStats;
+          if ((config.minMembers ?? -1) >= 0 && stats.member_count < (config.minMembers ?? 0)) return `群成员不足 ${config.minMembers} 人`;
+          if ((config.maxCapacity ?? -1) >= 0 && stats.max_member_count < (config.maxCapacity ?? 0)) return `群容量不足 ${config.maxCapacity} 人`;
           return true;
         } catch { return false; }
       }
@@ -187,86 +196,87 @@ export function apply(ctx: Context, config: Config = {}) {
     return false;
   };
 
-  // 手动处理
-  const setManual = async (session: Session, kind: RequestKind) => {
-    const messages = await notify(session, kind);
-    if (!messages?.length) return;
-
-    const task: Task = { session, kind, messages };
-    messages.forEach(id => tasks.set(id, task));
-
-    const limit = config.manualTimeout ?? 60;
-    if (limit > 0) {
+  const setupManual = async (session: Session, kind: RequestType) => {
+    const msgIds = await sendNotice(session, kind, 'waiting');
+    if (!msgIds?.length) return;
+    const task: VerifyTask = { session, kind, messages: msgIds };
+    msgIds.forEach(id => activeTasks.set(id, task));
+    const waitMinutes = config.timeout ?? 0;
+    if (waitMinutes > 0) {
       task.timer = setTimeout(async () => {
-        if (!tasks.has(messages[0])) return;
-        messages.forEach(id => tasks.delete(id));
-
-        const action = config.manualTimeoutAction || 'accept';
-        const pass = action === 'accept';
-        await doAction(session, kind, pass, pass ? '' : '等待超时，自动拒绝');
-
-        const target = config.notifyTarget || '';
-        const [type, id] = target.split(':');
-        if (id) {
-          const text = `等待超时，已自动${pass ? '通过' : '拒绝'}`;
-          await (type === 'private' ? session.bot.sendPrivateMessage(id, text) : session.bot.sendMessage(id, text));
+        if (!activeTasks.has(msgIds[0])) return;
+        msgIds.forEach(id => activeTasks.delete(id));
+        let finalAction = config.timeoutAction;
+        if (kind === 'member') {
+          const groupRule = config.verifyRules?.find(r => r.guildId === session.guildId);
+          if (groupRule?.groupAction) finalAction = groupRule.groupAction;
         }
-      }, limit * 60000);
+        const isPass = finalAction === 'accept';
+        await executeAction(session, kind, isPass, isPass ? '' : '等待人工超时，自动拒绝');
+        const notifyConfig = config.notifyTarget || '';
+        const [targetType, targetId] = notifyConfig.split(':');
+        if (targetId) {
+          const statusText = `已自动${isPass ? '通过' : '拒绝'}该请求`;
+          await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, statusText) : session.bot.sendMessage(targetId, statusText));
+        }
+      }, waitMinutes * 60000);
     }
   };
 
-  // 处理请求
-  const process = async (session: Session, kind: RequestKind) => {
+  const handleEvent = async (session: Session, kind: RequestType) => {
     try {
-      const result = await checkAuto(session, kind);
-      if (result === true) {
-        await doAction(session, kind, true);
-        await notify(session, kind);
-      } else if (typeof result === 'string') {
-        await doAction(session, kind, false, result);
-        await notify(session, kind);
-      } else {
-        await setManual(session, kind);
+      if (kind === 'member') {
+        if (config.verifyMode === 'manual') {
+          await setupManual(session, kind);
+          return;
+        }
+        if (config.verifyMode === 'strict') {
+          const matched = config.verifyRules?.some(r => r.guildId === session.guildId);
+          if (!matched) return;
+        }
       }
-    } catch (error) { logger.error(`处理请求出错: ${error}`); }
+      const verdict = await checkCriteria(session, kind);
+      if (verdict === true) {
+        await executeAction(session, kind, true);
+        await sendNotice(session, kind, 'auto_pass');
+      } else if (typeof verdict === 'string') {
+        await executeAction(session, kind, false, verdict);
+        await sendNotice(session, kind, 'auto_reject');
+      } else {
+        if (kind === 'member' && config.verifyMode === 'strict') return;
+        await setupManual(session, kind);
+      }
+    } catch (error) { logger.error(`处理失败: ${error}`); }
   };
 
-  // 注册中间件
-  if (config.enable !== false) {
-    const bind = (kind: RequestKind) => async (session: Session) => {
-      const data = session.event?._data || {};
-      session.userId = data.user_id?.toString();
-      if (kind !== 'friend') session.guildId = data.group_id?.toString();
-      await process(session, kind);
-    };
+  const hookEvent = (kind: RequestType) => async (session: Session) => {
+    const eventData = session.event?._data || {};
+    session.userId = eventData.user_id;
+    if (kind !== 'friend') session.guildId = eventData.group_id;
+    await handleEvent(session, kind);
+  };
 
-    ctx.on('friend-request', bind('friend'));
-    ctx.on('guild-request', bind('guild'));
-    ctx.on('guild-member-request', bind('member'));
-    ctx.on('guild-added', bind('guild'));
+  ctx.on('friend-request', hookEvent('friend'));
+  ctx.on('guild-request', hookEvent('guild'));
+  ctx.on('guild-member-request', hookEvent('member'));
+  ctx.on('guild-added', hookEvent('guild'));
 
-    ctx.middleware(async (session, next) => {
-      if (typeof session.content !== 'string' || !session.quote?.id) return next();
-      const task = tasks.get(session.quote.id);
-      if (!task) return next();
-
-      const target = config.notifyTarget || '';
-      const [type, id] = target.split(':');
-      if (type === 'private' ? session.userId !== id : session.guildId !== id) return next();
-
-      const text = session.content.replace(/<(quote|at)\s+[^>]*\/>/gi, '').trim();
-      const match = text.match(/^(y|n|通过|拒绝)(?:\s+(.*))?$/);
-      if (!match) return next();
-
-      if (task.timer) clearTimeout(task.timer);
-      task.messages.forEach(msg => tasks.delete(msg));
-
-      const pass = match[1] === 'y' || match[1] === '通过';
-      const extra = match[2]?.trim() || '';
-      const ok = await doAction(task.session, task.kind, pass, pass ? '' : extra, pass && task.kind === 'friend' ? extra : '');
-
-      const reply = ok ? `已${pass ? '通过' : '拒绝'}该请求` : `处理该请求时出错`;
-      await (type === 'private' ? session.bot.sendPrivateMessage(id, reply) : session.bot.sendMessage(id, reply));
-    });
-  }
+  ctx.middleware(async (session, next) => {
+    if (typeof session.content !== 'string' || !session.quote?.id) return next();
+    const activeTask = activeTasks.get(session.quote.id);
+    if (!activeTask) return next();
+    const notifyConfig = config.notifyTarget || '';
+    const [targetType, targetId] = notifyConfig.split(':');
+    if (targetType === 'private' ? session.userId !== targetId : session.guildId !== targetId) return next();
+    const input = session.content.replace(/<(quote|at)\s+[^>]*\/>/gi, '').trim();
+    const cmdMatch = input.match(/^(y|n|通过|拒绝)(?:\s+(.*))?$/);
+    if (!cmdMatch) return next();
+    if (activeTask.timer) clearTimeout(activeTask.timer);
+    activeTask.messages.forEach(msg => activeTasks.delete(msg));
+    const isApprove = cmdMatch[1] === 'y' || cmdMatch[1] === '通过';
+    const extraInfo = cmdMatch[2]?.trim() || '';
+    const isSuccess = await executeAction(activeTask.session, activeTask.kind, isApprove, isApprove ? '' : extraInfo, isApprove && activeTask.kind === 'friend' ? extraInfo : '');
+    const replyText = isSuccess ? `已${isApprove ? '通过' : '拒绝'}该请求` : `处理请求失败`;
+    await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, replyText) : session.bot.sendMessage(targetId, replyText));
+  });
 }
