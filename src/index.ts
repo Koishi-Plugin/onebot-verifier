@@ -146,7 +146,7 @@ export function apply(ctx: Context, config: Config = {}) {
   const checkCriteria = async (session: Session, kind: RequestType): Promise<boolean | string> => {
     const rawText = session.event?._data?.comment || '';
     const cleanLines = rawText.split(/[\r\n]+/)
-      .map((s: string) => s.trim()).filter((s: string) => /^(回答)[:：]/i.test(s)).map((s: string) => s.replace(/^(回答)[:：]\s*/i, ''));
+      .map((s: string) => s.trim()).filter((s: string) => /^(回答|答案)[:：]/i.test(s)).map((s: string) => s.replace(/^(回答|答案)[:：]\s*/i, ''));
     const verifyText = cleanLines.length > 0 ? cleanLines.join('\n') : rawText;
     if (kind === 'friend') {
       try {
@@ -169,7 +169,7 @@ export function apply(ctx: Context, config: Config = {}) {
       try {
         const userData = session.userId ? await ctx.database.getUser(session.platform, session.userId) : null;
         if (userData && userData.authority > 1) {
-          if (config.debugMode) logger.info(`[规则匹配] : ${userData.authority}`);
+          if (config.debugMode) logger.info(`[规则匹配] 白名单: ${userData.authority}`);
           return true;
         }
       } catch {}
@@ -218,14 +218,17 @@ export function apply(ctx: Context, config: Config = {}) {
 
   const handleEvent = async (session: Session, kind: RequestType) => {
     try {
-      if (config.debugMode) logger.info(`[收到请求] 类型:${kind} 数据:${JSON.stringify(session.event?._data || {})}`);
+      if (config.debugMode) logger.info(`[收到请求] 类型: ${kind} 数据:${JSON.stringify(session.event?._data || {})}`);
       if (kind === 'member') {
-        const rule = config.verifyRules?.find(r => r.guildId === session.guildId);
+        const rule = config.verifyRules?.find(r => String(r.guildId) === String(session.guildId));
         if (rule) {
           const rawText = session.event?._data?.comment || '';
+          const cleanLines = rawText.split(/[\r\n]+/)
+            .map((s: string) => s.trim()).filter((s: string) => /^(回答|答案)[:：]/i.test(s)).map((s: string) => s.replace(/^(回答|答案)[:：]\s*/i, ''));
+          const verifyText = cleanLines.length > 0 ? cleanLines.join('\n') : rawText;
           const stats = (rule.minLevel ?? -1) >= 0 && session.onebot && session.userId
             ? await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats : null;
-          const keywordMatch = !rule.keyword || new RegExp(rule.keyword, 'i').test(rawText);
+          const keywordMatch = !rule.keyword || new RegExp(rule.keyword, 'i').test(verifyText);
           const levelMatch = !stats || (stats.qqLevel ?? 0) >= rule.minLevel!;
           const isMatch = keywordMatch && levelMatch;
           if (config.debugMode) logger.info(`[规则判定] ${rule.guildId}: 关键词=${keywordMatch}, 等级=${levelMatch}, 结果=${isMatch}`);
