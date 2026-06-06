@@ -96,6 +96,7 @@ export function apply(ctx: Context, config: Config = {}) {
   const executeAction = async (session: Session, kind: RequestType, pass: boolean, reason = '', remark = ''): Promise<boolean> => {
     try {
       const eventData = session.event?._data || {};
+      if (config.debugMode) logger.info(`[执行操作] 类型:${kind} 结果:${pass ? '同意' : '拒绝'} 原因:${reason || '无'}`);
       if (!pass && kind === 'guild' && session.guildId && (session.event?.type === 'guild-added' || eventData.notice_type === 'group_increase')) {
         if (reason) {
           try { await session.bot.sendMessage(session.guildId, `${reason}，将退出该群`); }
@@ -149,11 +150,16 @@ export function apply(ctx: Context, config: Config = {}) {
     const verifyText = cleanLines.length > 0 ? cleanLines.join('\n') : rawText;
     if (kind === 'friend') {
       try {
-        if (config.friendRegex && new RegExp(config.friendRegex, 'i').test(verifyText)) return true;
+        if (config.friendRegex && new RegExp(config.friendRegex, 'i').test(verifyText)) {
+          if (config.debugMode) logger.info(`[规则匹配] 好友检查: ${config.friendRegex}`);
+          return true;
+        }
         const limitLevel = config.friendLevel ?? -1;
         if (limitLevel >= 0 && session.onebot && session.userId) {
           const stats = await session.onebot.getStrangerInfo(session.userId, true) as UserStats;
-          if ((stats.qqLevel ?? 0) < limitLevel) return `QQ 等级低于 ${limitLevel} 级`;
+          const isPassed = (stats.qqLevel ?? 0) >= limitLevel;
+          if (config.debugMode) logger.info(`[规则判定] 等级检查: ${stats.qqLevel} > ${limitLevel} = ${isPassed}`);
+          if (!isPassed) return `QQ 等级低于 ${limitLevel} 级`;
           return true;
         }
       } catch { return false; }
@@ -162,13 +168,22 @@ export function apply(ctx: Context, config: Config = {}) {
     if (kind === 'guild') {
       try {
         const userData = session.userId ? await ctx.database.getUser(session.platform, session.userId) : null;
-        if (userData && userData.authority > 1) return true;
+        if (userData && userData.authority > 1) {
+          if (config.debugMode) logger.info(`[规则匹配] : ${userData.authority}`);
+          return true;
+        }
       } catch {}
       if (session.onebot && session.guildId && ((config.minMembers ?? -1) >= 0 || (config.maxCapacity ?? -1) >= 0)) {
         try {
           const stats = await session.onebot.getGroupInfo(session.guildId, true) as GroupStats;
-          if ((config.minMembers ?? -1) >= 0 && stats.member_count < (config.minMembers ?? 0)) return `群成员不足 ${config.minMembers} 人`;
-          if ((config.maxCapacity ?? -1) >= 0 && stats.max_member_count < (config.maxCapacity ?? 0)) return `群容量不足 ${config.maxCapacity} 人`;
+          if ((config.minMembers ?? -1) >= 0 && stats.member_count < (config.minMembers ?? 0)) {
+            if (config.debugMode) logger.info(`[规则判定] 成员检查: ${stats.member_count} < ${config.minMembers}`);
+            return `群成员不足 ${config.minMembers} 人`;
+          }
+          if ((config.maxCapacity ?? -1) >= 0 && stats.max_member_count < (config.maxCapacity ?? 0)) {
+            if (config.debugMode) logger.info(`[规则判定] 容量检查: ${stats.max_member_count} < ${config.maxCapacity}`);
+            return `群容量不足 ${config.maxCapacity} 人`;
+          }
           return true;
         } catch { return false; }
       }
@@ -203,13 +218,17 @@ export function apply(ctx: Context, config: Config = {}) {
 
   const handleEvent = async (session: Session, kind: RequestType) => {
     try {
+      if (config.debugMode) logger.info(`[收到请求] 类型:${kind} 数据:${JSON.stringify(session.event?._data || {})}`);
       if (kind === 'member') {
         const rule = config.verifyRules?.find(r => r.guildId === session.guildId);
         if (rule) {
           const rawText = session.event?._data?.comment || '';
           const stats = (rule.minLevel ?? -1) >= 0 && session.onebot && session.userId
             ? await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats : null;
-          const isMatch = (!rule.keyword || new RegExp(rule.keyword, 'i').test(rawText)) && (!stats || (stats.qqLevel ?? 0) >= rule.minLevel!);
+          const keywordMatch = !rule.keyword || new RegExp(rule.keyword, 'i').test(rawText);
+          const levelMatch = !stats || (stats.qqLevel ?? 0) >= rule.minLevel!;
+          const isMatch = keywordMatch && levelMatch;
+          if (config.debugMode) logger.info(`[规则判定] ${rule.guildId}: 关键词=${keywordMatch}, 等级=${levelMatch}, 结果=${isMatch}`);
           if (isMatch && rule.action) {
             const isApprove = rule.action === 'accept';
             await executeAction(session, kind, isApprove, isApprove ? '' : '命中拒绝规则，自动拒绝');
@@ -258,6 +277,7 @@ export function apply(ctx: Context, config: Config = {}) {
     activeTask.messages.forEach(msg => activeTasks.delete(msg));
     const isApprove = cmdMatch[1] === 'y' || cmdMatch[1] === '通过';
     const extraInfo = cmdMatch[2]?.trim() || '';
+    if (config.debugMode) logger.info(`[人工回复] 用户 ${session.userId} 回复: ${cmdMatch[1]} 备注: ${extraInfo}`);
     const isSuccess = await executeAction(activeTask.session, activeTask.kind, isApprove, isApprove ? '' : extraInfo, isApprove && activeTask.kind === 'friend' ? extraInfo : '');
     const replyText = isSuccess ? `已${isApprove ? '通过' : '拒绝'}该请求` : `处理请求失败`;
     await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, replyText) : session.bot.sendMessage(targetId, replyText));
