@@ -39,7 +39,6 @@ interface VerifyTask {
 
 export interface Config {
   notifyTarget?: string
-  notifyAuto?: boolean
   debugMode?: boolean
   timeout?: number
   timeoutAction?: 'accept' | 'reject'
@@ -47,19 +46,18 @@ export interface Config {
   friendRegex?: string
   minMembers?: number
   maxCapacity?: number
-  verifyMode?: 'strict' | 'assist' | 'manual'
+  verifyMode?: 'accept' | 'reject' | 'manual'
   verifyRules?: {
     guildId: string;
     keyword?: string;
     minLevel?: number;
-    groupAction?: 'accept' | 'reject'
+    action?: 'accept' | 'reject'
   }[]
 }
 
 export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     notifyTarget: Schema.string().description('通知目标(guild/private:number)').required(),
-    notifyAuto: Schema.boolean().description('发送全部通知').default(true),
     debugMode: Schema.boolean().description('输出调试日志').default(false),
   }).description('基础配置'),
   Schema.object({
@@ -75,15 +73,15 @@ export const Config: Schema<Config> = Schema.intersect([
   }).description('好友邀群配置'),
   Schema.object({
     verifyMode: Schema.union([
-      Schema.const('strict').description('规则'),
-      Schema.const('assist').description('超时'),
+      Schema.const('accept').description('同意'),
+      Schema.const('reject').description('拒绝'),
       Schema.const('manual').description('手动'),
-    ]).description('处理模式').default('assist'),
+    ]).description('处理模式').default('manual'),
     verifyRules: Schema.array(Schema.object({
       guildId: Schema.string().description('群号').required(),
       keyword: Schema.string().description('正则'),
       minLevel: Schema.number().description('等级').default(-1),
-      groupAction: Schema.union([
+      action: Schema.union([
         Schema.const('accept').description('同意'),
         Schema.const('reject').description('拒绝'),
       ]).description('操作'),
@@ -121,7 +119,6 @@ export function apply(ctx: Context, config: Config = {}) {
     if (!notifyConfig) return [];
     const [targetType, targetId] = notifyConfig.split(':');
     if (!targetId || (targetType !== 'guild' && targetType !== 'private')) return [];
-    if (status !== 'waiting' && !config.notifyAuto) return [];
     try {
       const eventData = session.event?._data || {};
       const userInfo = session.userId ? await session.bot.getUser?.(session.userId)?.catch(() => null) : null;
@@ -150,19 +147,6 @@ export function apply(ctx: Context, config: Config = {}) {
     const cleanLines = rawText.split(/[\r\n]+/)
       .map((s: string) => s.trim()).filter((s: string) => /^(回答)[:：]/i.test(s)).map((s: string) => s.replace(/^(回答)[:：]\s*/i, ''));
     const verifyText = cleanLines.length > 0 ? cleanLines.join('\n') : rawText;
-    if (kind === 'member') {
-      const groupRule = config.verifyRules?.find(r => r.guildId === session.guildId);
-      if (!groupRule) return false;
-      try {
-        if (groupRule.keyword && !new RegExp(groupRule.keyword, 'i').test(verifyText)) return false;
-        const limitLevel = groupRule.minLevel ?? -1;
-        if (limitLevel >= 0 && session.onebot && session.userId) {
-          const stats = await session.onebot.getStrangerInfo(session.userId, true) as UserStats;
-          if ((stats.qqLevel ?? 0) < limitLevel) return `QQ 等级低于 ${limitLevel} 级`;
-        }
-      } catch { return false; }
-      return true;
-    }
     if (kind === 'friend') {
       try {
         if (config.friendRegex && new RegExp(config.friendRegex, 'i').test(verifyText)) return true;
@@ -203,12 +187,9 @@ export function apply(ctx: Context, config: Config = {}) {
       task.timer = setTimeout(async () => {
         if (!activeTasks.has(msgIds[0])) return;
         msgIds.forEach(id => activeTasks.delete(id));
-        let finalAction = config.timeoutAction;
-        if (kind === 'member') {
-          const groupRule = config.verifyRules?.find(r => r.guildId === session.guildId);
-          if (groupRule?.groupAction) finalAction = groupRule.groupAction;
-        }
-        const isPass = finalAction === 'accept';
+        const action = kind === 'member' ? config.verifyMode : config.timeoutAction;
+        if (action === 'manual' || !action) return;
+        const isPass = action === 'accept';
         await executeAction(session, kind, isPass, isPass ? '' : '等待人工超时，自动拒绝');
         const notifyConfig = config.notifyTarget || '';
         const [targetType, targetId] = notifyConfig.split(':');
@@ -223,14 +204,20 @@ export function apply(ctx: Context, config: Config = {}) {
   const handleEvent = async (session: Session, kind: RequestType) => {
     try {
       if (kind === 'member') {
-        if (config.verifyMode === 'manual') {
-          await setupManual(session, kind);
-          return;
+        const rule = config.verifyRules?.find(r => r.guildId === session.guildId);
+        if (rule) {
+          const rawText = session.event?._data?.comment || '';
+          const stats = (rule.minLevel ?? -1) >= 0 && session.onebot && session.userId
+            ? await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats : null;
+          const isMatch = (!rule.keyword || new RegExp(rule.keyword, 'i').test(rawText)) && (!stats || (stats.qqLevel ?? 0) >= rule.minLevel!);
+          if (isMatch && rule.action) {
+            const isApprove = rule.action === 'accept';
+            await executeAction(session, kind, isApprove, isApprove ? '' : '命中拒绝规则，自动拒绝');
+            await sendNotice(session, kind, isApprove ? 'auto_pass' : 'auto_reject');
+            return;
+          }
         }
-        if (config.verifyMode === 'strict') {
-          const matched = config.verifyRules?.some(r => r.guildId === session.guildId);
-          if (!matched) return;
-        }
+        return await setupManual(session, kind);
       }
       const verdict = await checkCriteria(session, kind);
       if (verdict === true) {
@@ -240,7 +227,6 @@ export function apply(ctx: Context, config: Config = {}) {
         await executeAction(session, kind, false, verdict);
         await sendNotice(session, kind, 'auto_reject');
       } else {
-        if (kind === 'member' && config.verifyMode === 'strict') return;
         await setupManual(session, kind);
       }
     } catch (error) { logger.error(`处理失败: ${error}`); }
