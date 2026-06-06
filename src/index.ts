@@ -150,15 +150,11 @@ export function apply(ctx: Context, config: Config = {}) {
     const cleanLines = rawText.split(/[\r\n]+/)
       .map((s: string) => s.trim()).filter((s: string) => /^(回答)[:：]/i.test(s)).map((s: string) => s.replace(/^(回答)[:：]\s*/i, ''));
     const verifyText = cleanLines.length > 0 ? cleanLines.join('\n') : rawText;
-    const toRegex = (text: string) => {
-      const match = text.match(/^\/(.+)\/([a-z]*)$/);
-      return match ? new RegExp(match[1], match[2]) : new RegExp(text, 'i');
-    };
     if (kind === 'member') {
       const groupRule = config.verifyRules?.find(r => r.guildId === session.guildId);
       if (!groupRule) return false;
       try {
-        if (groupRule.keyword && !toRegex(groupRule.keyword).test(verifyText)) return false;
+        if (groupRule.keyword && !new RegExp(groupRule.keyword, 'i').test(verifyText)) return false;
         const limitLevel = groupRule.minLevel ?? -1;
         if (limitLevel >= 0 && session.onebot && session.userId) {
           const stats = await session.onebot.getStrangerInfo(session.userId, true) as UserStats;
@@ -169,7 +165,7 @@ export function apply(ctx: Context, config: Config = {}) {
     }
     if (kind === 'friend') {
       try {
-        if (config.friendRegex && toRegex(config.friendRegex).test(verifyText)) return true;
+        if (config.friendRegex && new RegExp(config.friendRegex, 'i').test(verifyText)) return true;
         const limitLevel = config.friendLevel ?? -1;
         if (limitLevel >= 0 && session.onebot && session.userId) {
           const stats = await session.onebot.getStrangerInfo(session.userId, true) as UserStats;
