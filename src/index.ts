@@ -16,7 +16,7 @@ export const usage = `
 </div>
 `
 
-type RequestType = 'friend' | 'guild' | 'member'
+type RequestType = 'friend' | 'guild' | 'member' | 'removed'
 
 interface UserStats {
   user_id: number
@@ -40,6 +40,7 @@ interface VerifyTask {
 export interface Config {
   notifyTarget?: string
   debugMode?: boolean
+  kickBan?: boolean
   timeout?: number
   timeoutAction?: 'accept' | 'reject'
   friendLevel?: number
@@ -59,6 +60,7 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     notifyTarget: Schema.string().description('通知目标(guild/private:number)').required(),
     debugMode: Schema.boolean().description('输出调试日志').default(false),
+    kickBan: Schema.boolean().description('被踢自动处理').default(false),
   }).description('基础配置'),
   Schema.object({
     timeout: Schema.number().description('请求超时时长').default(360).min(0),
@@ -92,11 +94,13 @@ export const Config: Schema<Config> = Schema.intersect([
 export function apply(ctx: Context, config: Config = {}) {
   const logger = new Logger('onebot-verifier');
   const activeTasks = new Map<string, VerifyTask>();
+  const inviterMap = new Map<string, string>();
 
   const executeAction = async (session: Session, kind: RequestType, pass: boolean, reason = '', remark = ''): Promise<boolean> => {
     try {
       const eventData = session.event?._data || {};
       if (config.debugMode) logger.info(`[执行操作] 类型:${kind} 结果:${pass ? '同意' : '拒绝'} 原因:${reason || '无'}`);
+      if (pass && kind === 'guild' && session.guildId && session.userId) inviterMap.set(session.guildId, session.userId);
       if (!pass && kind === 'guild' && session.guildId && (session.event?.type === 'guild-added' || eventData.notice_type === 'group_increase')) {
         if (reason) {
           try { await session.bot.sendMessage(session.guildId, `${reason}，将退出该群`); }
@@ -124,15 +128,27 @@ export function apply(ctx: Context, config: Config = {}) {
       const eventData = session.event?._data || {};
       const userInfo = session.userId ? await session.bot.getUser?.(session.userId)?.catch(() => null) : null;
       const groupInfo = (kind !== 'friend' && session.guildId) ? await session.bot.getGuild?.(session.guildId)?.catch(() => null) : null;
-      const adminInfo = eventData.operator_id && session.userId && eventData.operator_id !== session.userId
-        ? await session.bot.getUser?.(eventData.operator_id)?.catch(() => null) : null;
+      const adminId = eventData.operator_id || session.event.operator?.id;
+      const adminInfo = adminId && session.userId && adminId !== session.userId
+        ? await session.bot.getUser?.(adminId)?.catch(() => null) : null;
       const infoLines = [];
       if (userInfo?.avatar) infoLines.push(`<image url="${userInfo.avatar}"/>`);
-      const typeName = kind === 'friend' ? '好友申请' : kind === 'member' ? '加群请求' : '群组邀请';
-      const statusText = status === 'auto_pass' ? '[自动通过]' : status === 'auto_reject' ? '[自动拒绝]' : '[等待处理]';
-      infoLines.push(`类型：${typeName} ${statusText}`);
-      if (kind !== 'guild' || session.userId !== session.selfId) infoLines.push(`用户：${userInfo?.name || session.userId}${session.userId ? `(${session.userId})` : ''}`);
-      if (adminInfo) infoLines.push(`管理：${adminInfo.name ? `${adminInfo.name}(${eventData.operator_id})` : eventData.operator_id}`);
+      let typeName = '';
+      if (kind === 'friend') typeName = '好友申请';
+      else if (kind === 'member') typeName = '加群请求';
+      else if (kind === 'guild') typeName = '群组邀请';
+      else if (kind === 'removed') typeName = eventData.sub_type === 'kick_me' ? '机器人被踢' : '机器人退群';
+      let statusText = '';
+      if (kind === 'removed') {
+        if (eventData.sub_type === 'kick_me' && config.kickBan) statusText = ' [自动清理]';
+      } else {
+        statusText = status === 'auto_pass' ? ' [自动通过]' : status === 'auto_reject' ? ' [自动拒绝]' : ' [等待处理]';
+      }
+      infoLines.push(`类型：${typeName}${statusText}`);
+      if ((kind !== 'guild' && kind !== 'removed') || session.userId !== session.selfId) {
+        infoLines.push(`用户：${userInfo?.name || session.userId}${session.userId ? `(${session.userId})` : ''}`);
+      }
+      if (adminInfo) infoLines.push(`管理：${adminInfo.name ? `${adminInfo.name}(${adminId})` : adminId}`);
       if (groupInfo) infoLines.push(`群组：${groupInfo.name ? `${groupInfo.name}(${session.guildId})` : session.guildId}`);
       if (eventData.comment) infoLines.push(`验证信息：${eventData.comment}`);
       const content = infoLines.join('\n');
@@ -265,6 +281,18 @@ export function apply(ctx: Context, config: Config = {}) {
   ctx.on('guild-request', hookEvent('guild'));
   ctx.on('guild-member-request', hookEvent('member'));
   ctx.on('guild-added', hookEvent('guild'));
+  ctx.on('guild-removed', async (session) => {
+    const subType = session.event?._data?.sub_type;
+    if (subType === 'kick_me') {
+      const inviterId = inviterMap.get(session.guildId!);
+      if (inviterId) {
+        await session.onebot?.deleteFriend(inviterId);
+        inviterMap.delete(session.guildId!);
+      }
+      await session.execute(`analyse.clear -g ${session.guildId}`).catch(() => {});
+    }
+    await sendNotice(session, 'removed');
+  });
 
   ctx.middleware(async (session, next) => {
     if (typeof session.content !== 'string' || !session.quote?.id) return next();
