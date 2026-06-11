@@ -40,6 +40,13 @@ interface VerifyTask {
   votes?: { yes: Set<string>, no: Set<string> };
 }
 
+interface CaptchaTask {
+  guildId: string;
+  userId: string;
+  answer: string;
+  timer: NodeJS.Timeout;
+}
+
 export interface Config {
   notifyTarget?: string
   debugMode?: boolean
@@ -57,12 +64,13 @@ export interface Config {
     minLevel?: number;
     action?: 'accept' | 'reject'
   }[]
-  voteRatio?: string
   syncNotify?: boolean
   specialRules?: {
     guildId: string;
-    mode: 'vote';
+    enabled: boolean;
+    mode: 'vote' | 'captcha';
   }[]
+  voteRatio?: string
 }
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -96,7 +104,7 @@ export const Config: Schema<Config> = Schema.intersect([
         Schema.const('accept').description('同意'),
         Schema.const('reject').description('拒绝'),
       ]).description('操作'),
-    })).description('加群验证配置').role('table'),
+    })).description('普通验证配置').role('table'),
   }).description('加群请求配置'),
   Schema.object({
     syncNotify: Schema.boolean().description('同步通知目标').default(true),
@@ -104,8 +112,10 @@ export const Config: Schema<Config> = Schema.intersect([
       guildId: Schema.string().description('群号').required(),
       mode: Schema.union([
         Schema.const('vote').description('投票'),
+        Schema.const('captcha').description('验证码'),
       ]).description('模式').default('vote'),
-    })).description('群组特殊配置').role('table'),
+      enabled: Schema.boolean().description('前置规则').default(true),
+    })).description('配置列表').role('table'),
     voteRatio: Schema.string().description('投票比例').default('3:2'),
   }).description('特殊验证配置')
 ])
@@ -113,6 +123,7 @@ export const Config: Schema<Config> = Schema.intersect([
 export function apply(ctx: Context, config: Config = {}) {
   const logger = new Logger('onebot-verifier');
   const activeTasks = new Map<string, VerifyTask>();
+  const activeCaptchas = new Map<string, CaptchaTask>();
   const inviterMap = new Map<string, string>();
 
   const getComment = (comment?: string) => {
@@ -176,25 +187,6 @@ export function apply(ctx: Context, config: Config = {}) {
     }
   };
 
-  const handleSpecialRule = async (session: Session, kind: RequestType): Promise<boolean> => {
-    if (kind !== 'member' || !config.specialRules || config.specialRules.length === 0) return false;
-    const rule = config.specialRules.find(r => String(r.guildId) === String(session.guildId));
-    if (!rule) return false;
-    if (rule.mode === 'vote') {
-      const [yesStr, noStr] = config.voteRatio!.split(':');
-      const targetYes = parseInt(yesStr) || 0;
-      const targetNo = parseInt(noStr) || 0;
-      let msgIds: string[] = [];
-      if (config.syncNotify !== false) msgIds = await sendNotice(session, kind, 'waiting');
-      if (msgIds.length > 0) {
-        const task: VerifyTask = { session, kind, messages: msgIds, specialMode: 'vote', voteTarget: { yes: targetYes, no: targetNo }, votes: { yes: new Set(), no: new Set() } };
-        msgIds.forEach(id => activeTasks.set(id, task));
-      }
-      return true;
-    }
-    return false;
-  };
-
   const setupManual = async (session: Session, kind: RequestType) => {
     const waitMinutes = config.timeout ?? 0;
     const action = kind === 'member' ? config.verifyMode : config.timeoutAction;
@@ -234,7 +226,6 @@ export function apply(ctx: Context, config: Config = {}) {
       if (config.debugMode) logger.info(`[收到请求] 类型: ${kind} 数据: ${JSON.stringify(session.event?._data || {})}`);
       const verifyText = getComment(session.event?._data?.comment);
       if (kind === 'member') {
-        if (await handleSpecialRule(session, kind)) return;
         const rules = config.verifyRules?.filter(r => String(r.guildId) === String(session.guildId)) || [];
         for (const rule of rules) {
           const minL = rule.minLevel ?? 0;
@@ -252,9 +243,29 @@ export function apply(ctx: Context, config: Config = {}) {
             return;
           }
         }
+        const specialRule = config.specialRules?.find(r => String(r.guildId) === String(session.guildId) && r.enabled);
+        if (specialRule) {
+          if (specialRule.mode === 'vote') {
+            const [yesStr, noStr] = config.voteRatio!.split(':');
+            const targetYes = parseInt(yesStr) || 0;
+            const targetNo = parseInt(noStr) || 0;
+            let msgIds: string[] = [];
+            if (config.syncNotify !== false) msgIds = await sendNotice(session, kind, 'waiting');
+            if (msgIds.length > 0) {
+              const task: VerifyTask = { session, kind, messages: msgIds, specialMode: 'vote', voteTarget: { yes: targetYes, no: targetNo }, votes: { yes: new Set(), no: new Set() } };
+              msgIds.forEach(id => activeTasks.set(id, task));
+            }
+            return;
+          }
+          if (specialRule.mode === 'captcha') {
+            await executeAction(session, kind, true, '验证码验证，自动通过');
+            if (config.syncNotify !== false) await sendNotice(session, kind, 'auto_pass');
+            return;
+          }
+        }
         if (config.verifyMode && config.verifyMode !== 'manual') {
           const isApprove = config.verifyMode === 'accept';
-          await executeAction(session, kind, isApprove, '等待超时，自动处理');
+          await executeAction(session, kind, isApprove, '默认规则，自动处理');
           await sendNotice(session, kind, isApprove ? 'auto_pass' : 'auto_reject');
           return;
         }
@@ -347,6 +358,26 @@ export function apply(ctx: Context, config: Config = {}) {
   ctx.on('guild-member-request', hookEvent('member'));
   ctx.on('guild-added', hookEvent('guild'));
 
+  ctx.on('guild-member-added', async (session) => {
+    if (!config.specialRules || !session.guildId || !session.userId) return;
+    const rule = config.specialRules.find(r => String(r.guildId) === String(session.guildId) && r.enabled);
+    if (rule?.mode === 'captcha') {
+      const a = Math.floor(Math.random() * 20) + 1;
+      const b = Math.floor(Math.random() * 20) + 1;
+      const answer = (a + b).toString();
+      const captchaKey = `${session.guildId}:${session.userId}`;
+      await session.send(`<at id="${session.userId}"/> 请在 60 秒内回复计算结果，以进行验证：${a} + ${b} =`);
+      const timer = setTimeout(async () => {
+        if (activeCaptchas.has(captchaKey)) {
+          activeCaptchas.delete(captchaKey);
+          await session.send(`<at id="${session.userId}"/> 验证失败，将被移出本群。`);
+          await session.onebot?.setGroupKick(session.guildId!, session.userId!, false);
+        }
+      }, 60000);
+      activeCaptchas.set(captchaKey, { guildId: session.guildId, userId: session.userId, answer, timer });
+    }
+  });
+
   ctx.on('guild-removed', async (session) => {
     if (session.event?._data?.sub_type === 'kick_me') {
       const gid = session.guildId;
@@ -364,7 +395,21 @@ export function apply(ctx: Context, config: Config = {}) {
   });
 
   ctx.middleware(async (session, next) => {
-    if (typeof session.content !== 'string' || !session.quote?.id) return next();
+    if (typeof session.content !== 'string') return next();
+    if (session.guildId && session.userId) {
+      const captchaKey = `${session.guildId}:${session.userId}`;
+      const captcha = activeCaptchas.get(captchaKey);
+      if (captcha) {
+        const input = session.content.trim();
+        if (input === captcha.answer) {
+          clearTimeout(captcha.timer);
+          activeCaptchas.delete(captchaKey);
+          await session.send(`<at id="${session.userId}"/> 验证成功，欢迎加入本群！`);
+          return;
+        }
+      }
+    }
+    if (!session.quote?.id) return next();
     const task = activeTasks.get(session.quote.id);
     if (!task) return next();
     const [targetType, targetId] = (config.notifyTarget || '').split(':');
