@@ -70,6 +70,7 @@ export interface Config {
     enabled: boolean;
     mode: 'vote' | 'captcha';
   }[]
+  captchaDiff?: 'simple' | 'medium' | 'hard'
   voteRatio?: string
 }
 
@@ -116,7 +117,12 @@ export const Config: Schema<Config> = Schema.intersect([
       ]).description('模式').default('vote'),
       enabled: Schema.boolean().description('前置规则').default(true),
     })).description('配置列表').role('table'),
-    voteRatio: Schema.string().description('投票比例').default('3:2'),
+    voteRatio: Schema.string().description('[投票]人数').default('3:2'),
+    captchaDiff: Schema.union([
+      Schema.const('simple').description('简单'),
+      Schema.const('medium').description('中等'),
+      Schema.const('hard').description('困难'),
+    ]).description('[验证码]难度').default('simple'),
   }).description('特殊验证配置')
 ])
 
@@ -362,11 +368,31 @@ export function apply(ctx: Context, config: Config = {}) {
     if (!config.specialRules || !session.guildId || !session.userId) return;
     const rule = config.specialRules.find(r => String(r.guildId) === String(session.guildId) && r.enabled);
     if (rule?.mode === 'captcha') {
-      const a = Math.floor(Math.random() * 20) + 1;
-      const b = Math.floor(Math.random() * 20) + 1;
-      const answer = (a + b).toString();
+      let a: number, b: number, op: string = '+', answer: string;
+      if (config.captchaDiff === 'simple') {
+        a = Math.floor(Math.random() * 80) + 10;
+        b = Math.floor(Math.random() * 80) + 10;
+        if (Math.random() > 0.5) {
+          op = '+';
+          answer = (a + b).toString();
+        } else {
+          op = '-';
+          if (a < b) [a, b] = [b, a];
+          answer = (a - b).toString();
+        }
+      } else if (config.captchaDiff === 'medium') {
+        a = Math.floor(Math.random() * 89) + 11;
+        b = Math.floor(Math.random() * 8) + 2;
+        op = '×';
+        answer = (a * b).toString();
+      } else {
+        a = Math.floor(Math.random() * 40) + 11;
+        b = Math.floor(Math.random() * 10) + 11;
+        op = '×';
+        answer = (a * b).toString();
+      }
       const captchaKey = `${session.guildId}:${session.userId}`;
-      await session.send(`<at id="${session.userId}"/> 请在 60 秒内回复计算结果，以进行验证：${a} + ${b} =`);
+      await session.send(`<at id="${session.userId}"/> 请在 60 秒内回复计算结果，以进行验证：${a} ${op} ${b} =`);
       const timer = setTimeout(async () => {
         if (activeCaptchas.has(captchaKey)) {
           activeCaptchas.delete(captchaKey);
