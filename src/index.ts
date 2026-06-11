@@ -236,23 +236,25 @@ export function apply(ctx: Context, config: Config = {}) {
     try {
       if (config.debugMode) logger.info(`[收到请求] 类型: ${kind} 数据:${JSON.stringify(session.event?._data || {})}`);
       if (kind === 'member') {
-        const rule = config.verifyRules?.find(r => String(r.guildId) === String(session.guildId));
-        if (rule) {
+        const rules = config.verifyRules?.filter(r => String(r.guildId) === String(session.guildId)) || [];
+        if (rules.length > 0) {
           const rawText = session.event?._data?.comment || '';
           const cleanLines = rawText.split(/[\r\n]+/)
             .map((s: string) => s.trim()).filter((s: string) => /^(回答|答案)[:：]/i.test(s)).map((s: string) => s.replace(/^(回答|答案)[:：]\s*/i, ''));
           const verifyText = cleanLines.length > 0 ? cleanLines.join('\n') : rawText;
-          const stats = (rule.minLevel ?? -1) >= 0 && session.onebot && session.userId
-            ? await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats : null;
-          const keywordMatch = !rule.keyword || new RegExp(rule.keyword, 'i').test(verifyText);
-          const levelMatch = !stats || (stats.qqLevel ?? 0) >= rule.minLevel!;
-          const isMatch = keywordMatch && levelMatch;
-          if (config.debugMode) logger.info(`[规则判定] ${rule.guildId}: 关键词=${keywordMatch}, 等级=${levelMatch}, 结果=${isMatch}`);
-          if (isMatch && rule.action) {
-            const isApprove = rule.action === 'accept';
-            await executeAction(session, kind, isApprove, isApprove ? '' : '命中拒绝规则，自动拒绝');
-            await sendNotice(session, kind, isApprove ? 'auto_pass' : 'auto_reject');
-            return;
+          for (const rule of rules) {
+            const stats = (rule.minLevel ?? -1) >= 0 && session.onebot && session.userId
+              ? await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats : null;
+            const keywordMatch = !rule.keyword || new RegExp(rule.keyword, 'i').test(verifyText);
+            const levelMatch = !stats || (stats.qqLevel ?? 0) >= rule.minLevel!;
+            const isMatch = keywordMatch && levelMatch;
+            if (config.debugMode) logger.info(`[规则判定] ${rule.guildId}: 关键词="${rule.keyword}"=${keywordMatch}; 等级="${rule.minLevel}"=${levelMatch}`);
+            if (isMatch && rule.action) {
+              const isApprove = rule.action === 'accept';
+              await executeAction(session, kind, isApprove, isApprove ? '' : '命中拒绝规则，自动拒绝');
+              await sendNotice(session, kind, isApprove ? 'auto_pass' : 'auto_reject');
+              return;
+            }
           }
         }
         return await setupManual(session, kind);
