@@ -38,6 +38,7 @@ interface VerifyTask {
   specialMode?: 'vote';
   voteTarget?: { yes: number, no: number };
   votes?: { yes: Set<string>, no: Set<string> };
+  inSitu?: boolean;
 }
 
 interface CaptchaTask {
@@ -71,6 +72,7 @@ export interface Config {
   }[]
   captchaDiff?: 'simple' | 'medium' | 'hard'
   voteRatio?: string
+  voteInSitu?: boolean
 }
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -115,12 +117,13 @@ export const Config: Schema<Config> = Schema.intersect([
       ]).description('模式').default('vote'),
       enabled: Schema.boolean().description('前置规则').default(true),
     })).description('配置列表').role('table'),
-    voteRatio: Schema.string().description('[投票]人数').default('3:2'),
+    voteRatio: Schema.string().description('[投票]支持/反对人数').default('3:2'),
+    voteInSitu: Schema.boolean().description('[投票]对应群中发起').default(true),
     captchaDiff: Schema.union([
       Schema.const('simple').description('简单'),
       Schema.const('medium').description('中等'),
       Schema.const('hard').description('困难'),
-    ]).description('[验证码]难度').default('simple'),
+    ]).description('[验证]难度').default('simple'),
   }).description('特殊验证配置')
 ])
 
@@ -162,8 +165,8 @@ export function apply(ctx: Context, config: Config = {}) {
     }
   };
 
-  const sendNotice = async (session: Session, kind: RequestType, status: 'auto_pass' | 'auto_reject' | 'waiting' = 'waiting'): Promise<string[]> => {
-    const notifyConfig = config.notifyTarget || '';
+  const sendNotice = async (session: Session, kind: RequestType, status: 'auto_pass' | 'auto_reject' | 'waiting' = 'waiting', overrideTarget?: string): Promise<string[]> => {
+    const notifyConfig = overrideTarget || config.notifyTarget || '';
     const [targetType, targetId] = notifyConfig.split(':');
     if (!targetId || !session.bot) return [];
     try {
@@ -191,12 +194,14 @@ export function apply(ctx: Context, config: Config = {}) {
     }
   };
 
-  const setupManual = async (session: Session, kind: RequestType, specialMode?: 'vote') => {
+  const setupManual = async (session: Session, kind: RequestType, specialMode?: 'vote', useInSitu?: boolean) => {
     const waitMinutes = config.timeout ?? 0;
     const action = kind === 'member' ? config.verifyMode : config.timeoutAction;
-    const msgIds = await sendNotice(session, kind, 'waiting');
+    let targetStr = config.notifyTarget || '';
+    if (useInSitu && kind === 'member' && session.guildId) targetStr = `guild:${session.guildId}`;
+    const msgIds = await sendNotice(session, kind, 'waiting', targetStr);
     if (!msgIds?.length) return;
-    const task: VerifyTask = { session, kind, messages: msgIds, specialMode };
+    const task: VerifyTask = { session, kind, messages: msgIds, specialMode, inSitu: useInSitu };
     if (specialMode === 'vote') {
       const [yesStr, noStr] = config.voteRatio!.split(':');
       task.voteTarget = { yes: parseInt(yesStr) || 0, no: parseInt(noStr) || 0 };
@@ -212,7 +217,7 @@ export function apply(ctx: Context, config: Config = {}) {
         if (finalAction === 'manual') return;
         const isPass = finalAction === 'accept';
         await executeAction(session, kind, isPass, isPass ? '' : '等待超时，自动拒绝');
-        const [targetType, targetId] = (config.notifyTarget || '').split(':');
+        const [targetType, targetId] = targetStr.split(':');
         if (targetId && session.bot) {
           const statusText = `已自动${isPass ? '通过' : '拒绝'}该请求`;
           await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, statusText) : session.bot.sendMessage(targetId, statusText)).catch(() => {});
@@ -249,7 +254,7 @@ export function apply(ctx: Context, config: Config = {}) {
         }
         const specialRule = config.specialRules?.find(r => String(r.guildId) === String(session.guildId) && r.enabled);
         if (specialRule) {
-          if (specialRule.mode === 'vote') return await setupManual(session, kind, 'vote');
+          if (specialRule.mode === 'vote') return await setupManual(session, kind, 'vote', config.voteInSitu);
           if (specialRule.mode === 'captcha') {
             await executeAction(session, kind, true, '验证码验证，自动通过');
             await sendNotice(session, kind, 'auto_pass');
@@ -307,7 +312,7 @@ export function apply(ctx: Context, config: Config = {}) {
     }
   };
 
-  const handleSpecialVote = async (session: Session, task: VerifyTask, isApprove: boolean, extraInfo: string, targetType: string, targetId: string) => {
+  const handleSpecialVote = async (session: Session, task: VerifyTask, isApprove: boolean, extraInfo: string) => {
     if (!task.voteTarget || !task.votes) return;
     const voterId = session.userId;
     if (!voterId) return;
@@ -333,7 +338,7 @@ export function apply(ctx: Context, config: Config = {}) {
     task.messages.forEach(msg => activeTasks.delete(msg));
     const isSuccess = await executeAction(task.session, task.kind, finalVerdict, finalVerdict ? '' : extraInfo);
     const replyText = isSuccess ? `已${finalVerdict ? '通过' : '拒绝'}该投票` : `处理投票失败`;
-    if (session.bot) await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, replyText) : session.bot.sendMessage(targetId, replyText)).catch(() => {});
+    await session.send(replyText).catch(() => {});
   };
 
   ctx.on('friend-request', hookEvent('friend'));
@@ -415,9 +420,10 @@ export function apply(ctx: Context, config: Config = {}) {
     if (!session.quote?.id) return next();
     const task = activeTasks.get(session.quote.id);
     if (!task) return next();
-    const [targetType, targetId] = (config.notifyTarget || '').split(':');
-    const isMatched = targetType === 'private' ? (session.userId === targetId) : (session.guildId === targetId);
-    if (!isMatched) return next();
+    const [ntType, ntId] = (config.notifyTarget || '').split(':');
+    const isGlobalNotifyTarget = ntType === 'private' ? (session.userId === ntId) : (session.guildId === ntId);
+    const isInSituGuild = task.inSitu && session.guildId && session.guildId === task.session.guildId;
+    if (!isGlobalNotifyTarget && !isInSituGuild) return next();
     const input = session.content.replace(/<(quote|at)\s+[^>]*\/>/gi, '').trim();
     const cmdMatch = input.match(/^(y|n|通过|拒绝)(?:\s+(.*))?$/i);
     if (!cmdMatch) return next();
@@ -425,13 +431,13 @@ export function apply(ctx: Context, config: Config = {}) {
     const extraInfo = cmdMatch[2]?.trim() || '';
     if (config.debugMode) logger.info(`[操作] 收到指令: ${isApprove ? '同意' : '拒绝'}`);
     if (task.specialMode === 'vote') {
-      await handleSpecialVote(session, task, isApprove, extraInfo, targetType, targetId);
+      await handleSpecialVote(session, task, isApprove, extraInfo);
       return;
     }
     if (task.timer) clearTimeout(task.timer);
     task.messages.forEach(msg => activeTasks.delete(msg));
     const isSuccess = await executeAction(task.session, task.kind, isApprove, isApprove ? '' : extraInfo, (isApprove && task.kind === 'friend') ? extraInfo : '');
     const replyText = isSuccess ? `已${isApprove ? '通过' : '拒绝'}该请求` : `处理请求失败`;
-    if (session.bot) await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, replyText) : session.bot.sendMessage(targetId, replyText)).catch(() => {});
+    await session.send(replyText).catch(() => {});
   });
 }
