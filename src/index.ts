@@ -64,7 +64,6 @@ export interface Config {
     minLevel?: number;
     action?: 'accept' | 'reject'
   }[]
-  syncNotify?: boolean
   specialRules?: {
     guildId: string;
     enabled: boolean;
@@ -108,7 +107,6 @@ export const Config: Schema<Config> = Schema.intersect([
     })).description('普通验证配置').role('table'),
   }).description('加群请求配置'),
   Schema.object({
-    syncNotify: Schema.boolean().description('同步通知目标').default(true),
     specialRules: Schema.array(Schema.object({
       guildId: Schema.string().description('群号').required(),
       mode: Schema.union([
@@ -183,7 +181,7 @@ export function apply(ctx: Context, config: Config = {}) {
       if (adminId) infoLines.push(`管理：${adminInfo?.name ? `${adminInfo.name}(${adminId})` : adminId}`);
       if (session.guildId) infoLines.push(`群组：${groupInfo?.name ? `${groupInfo.name}(${session.guildId})` : session.guildId}`);
       if (eventData.comment) infoLines.push(`验证信息：${eventData.comment}`);
-      if (status === 'waiting') infoLines.push(`使用"y/n"回复本消息，以同意/拒绝该请求`);
+      if (status === 'waiting' && kind !== 'removed') infoLines.push(`回复"y/n"以同意/拒绝该请求`);
       const content = infoLines.join('\n');
       const msgIds = await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, content) : session.bot.sendMessage(targetId, content)) || [];
       return msgIds;
@@ -193,18 +191,24 @@ export function apply(ctx: Context, config: Config = {}) {
     }
   };
 
-  const setupManual = async (session: Session, kind: RequestType) => {
+  const setupManual = async (session: Session, kind: RequestType, specialMode?: 'vote') => {
     const waitMinutes = config.timeout ?? 0;
     const action = kind === 'member' ? config.verifyMode : config.timeoutAction;
-    if (waitMinutes > 0) {
-      const msgIds = await sendNotice(session, kind, 'waiting');
-      if (!msgIds?.length) return;
-      const task: VerifyTask = { session, kind, messages: msgIds };
-      msgIds.forEach(id => activeTasks.set(id, task));
+    const msgIds = await sendNotice(session, kind, 'waiting');
+    if (!msgIds?.length) return;
+    const task: VerifyTask = { session, kind, messages: msgIds, specialMode };
+    if (specialMode === 'vote') {
+      const [yesStr, noStr] = config.voteRatio!.split(':');
+      task.voteTarget = { yes: parseInt(yesStr) || 0, no: parseInt(noStr) || 0 };
+      task.votes = { yes: new Set(), no: new Set() };
+    }
+    msgIds.forEach(id => activeTasks.set(id, task));
+    if (waitMinutes > 0 && (specialMode === 'vote' || action !== 'manual')) {
       task.timer = setTimeout(async () => {
         if (!activeTasks.has(msgIds[0])) return;
         msgIds.forEach(id => activeTasks.delete(id));
-        const finalAction = kind === 'member' ? (config.verifyMode ?? 'manual') : (config.timeoutAction ?? 'accept');
+        let finalAction = action;
+        if (specialMode === 'vote' && finalAction === 'manual') finalAction = 'reject';
         if (finalAction === 'manual') return;
         const isPass = finalAction === 'accept';
         await executeAction(session, kind, isPass, isPass ? '' : '等待超时，自动拒绝');
@@ -215,12 +219,6 @@ export function apply(ctx: Context, config: Config = {}) {
         }
         if (config.debugMode) logger.info(`[操作] 等待超时，默认${isPass ? '通过' : '拒绝'}`);
       }, waitMinutes * 60000);
-    } else {
-      if (action === 'manual' || !action) return await sendNotice(session, kind, 'waiting');
-      const isPass = action === 'accept';
-      await executeAction(session, kind, isPass, '等待超时，自动处理');
-      await sendNotice(session, kind, isPass ? 'auto_pass' : 'auto_reject');
-      if (config.debugMode) logger.info(`[操作] 无需等待，默认${isPass ? '通过' : '拒绝'}`);
     }
   };
 
@@ -229,43 +227,32 @@ export function apply(ctx: Context, config: Config = {}) {
     if (eventData.user_id) session.userId = String(eventData.user_id);
     if (eventData.group_id) session.guildId = String(eventData.group_id);
     try {
-      if (config.debugMode) logger.info(`[收到请求] 类型: ${kind} 数据: ${JSON.stringify(session.event?._data || {})}`);
-      const verifyText = getComment(session.event?._data?.comment);
+      if (config.debugMode) logger.info(`[请求] 类型: ${kind} 数据: ${JSON.stringify(eventData)}`);
+      const verifyText = getComment(eventData.comment);
       if (kind === 'member') {
         const rules = config.verifyRules?.filter(r => String(r.guildId) === String(session.guildId)) || [];
         for (const rule of rules) {
-          const minL = rule.minLevel ?? 0;
-          const stats = (minL > 0 && session.onebot && session.userId) ? await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats : null;
+          const stats = ((rule.minLevel ?? 0) > 0 && session.onebot && session.userId) ? await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats : null;
+          const levelMatch = (stats?.qqLevel ?? 0) >= (rule.minLevel ?? 0);
           const keywordMatch = !rule.keyword || new RegExp(rule.keyword, 'i').test(verifyText);
-          const levelMatch = !stats || (stats.qqLevel ?? 0) >= minL;
           if (config.debugMode) {
-            if (rule.keyword) logger.info(`[加群验证] 内容 "${verifyText}" ${keywordMatch ? '匹配' : '不匹配'}正则 "${rule.keyword}"`);
-            if (stats) logger.info(`[加群验证] 用户 ${session.userId} 等级 ${stats.qqLevel ?? 0}${levelMatch ? '>' : '<'}${minL}`);
+            if ((rule.minLevel ?? 0) > 0) logger.info(`[加群请求] ${session.userId} 等级 ${stats?.qqLevel ?? 0} ${levelMatch ? '>' : '<'} "${rule.minLevel ?? 0}"`);
+            if (rule.keyword) logger.info(`[加群请求] ${session.userId} 内容 "${verifyText}" ${keywordMatch ? '=' : '≠'} "${rule.keyword}"`);
           }
-          if (keywordMatch && levelMatch && rule.action) {
-            const isApprove = rule.action === 'accept';
-            await executeAction(session, kind, isApprove, isApprove ? '' : '命中规则，自动拒绝');
-            await sendNotice(session, kind, isApprove ? 'auto_pass' : 'auto_reject');
-            return;
+          if (levelMatch && keywordMatch) {
+            if (rule.action) {
+              await executeAction(session, kind, rule.action === 'accept', rule.action === 'accept' ? '' : '命中规则，自动拒绝');
+              await sendNotice(session, kind, rule.action === 'accept' ? 'auto_pass' : 'auto_reject');
+              return;
+            }
           }
         }
         const specialRule = config.specialRules?.find(r => String(r.guildId) === String(session.guildId) && r.enabled);
         if (specialRule) {
-          if (specialRule.mode === 'vote') {
-            const [yesStr, noStr] = config.voteRatio!.split(':');
-            const targetYes = parseInt(yesStr) || 0;
-            const targetNo = parseInt(noStr) || 0;
-            let msgIds: string[] = [];
-            if (config.syncNotify !== false) msgIds = await sendNotice(session, kind, 'waiting');
-            if (msgIds.length > 0) {
-              const task: VerifyTask = { session, kind, messages: msgIds, specialMode: 'vote', voteTarget: { yes: targetYes, no: targetNo }, votes: { yes: new Set(), no: new Set() } };
-              msgIds.forEach(id => activeTasks.set(id, task));
-            }
-            return;
-          }
+          if (specialRule.mode === 'vote') return await setupManual(session, kind, 'vote');
           if (specialRule.mode === 'captcha') {
             await executeAction(session, kind, true, '验证码验证，自动通过');
-            if (config.syncNotify !== false) await sendNotice(session, kind, 'auto_pass');
+            await sendNotice(session, kind, 'auto_pass');
             return;
           }
         }
@@ -273,42 +260,37 @@ export function apply(ctx: Context, config: Config = {}) {
       }
       let verdict: boolean | string = false;
       if (kind === 'friend') {
+        let levelPass = true, regexPass = true;
+        if (config.friendLevel && config.friendLevel > 0 && session.onebot && session.userId) {
+          const stats = await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats;
+          levelPass = (stats.qqLevel ?? 0) >= config.friendLevel;
+          if (config.debugMode) logger.info(`[好友验证] ${session.userId} 等级 ${stats.qqLevel ?? 0} ${levelPass ? '>' : '<'} "${config.friendLevel}"`);
+        }
         if (config.friendRegex) {
-          const isRegexMatched = new RegExp(config.friendRegex, 'i').test(verifyText);
-          if (config.debugMode) logger.info(`[好友验证] 内容 "${verifyText}" ${isRegexMatched ? '匹配' : '不匹配'}正则 "${config.friendRegex}" `);
-          if (isRegexMatched) verdict = true;
+          regexPass = new RegExp(config.friendRegex, 'i').test(verifyText);
+          if (config.debugMode) logger.info(`[好友验证] ${session.userId} 内容 "${verifyText}" ${regexPass ? '=' : '≠'} "${config.friendRegex}"`);
         }
-        if (verdict !== true) {
-          const fLevel = config.friendLevel ?? 0;
-          if (fLevel > 0 && session.onebot && session.userId) {
-            const stats = await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats;
-            const isLevelMatched = (stats.qqLevel ?? 0) >= fLevel;
-            if (config.debugMode) logger.info(`[好友验证] 用户 ${session.userId} 等级 ${stats.qqLevel ?? 0}${isLevelMatched ? '>' : '<'}${fLevel}`);
-            if (isLevelMatched) verdict = true;
-          }
-        }
-      } else if (kind === 'guild') {
+        verdict = levelPass && regexPass;
+      }
+      else if (kind === 'guild') {
         if (ctx.database && session.userId) {
-          const userData = await ctx.database.getUser(session.platform, session.userId, ['authority']).catch(() => null);
-          if (userData && userData.authority > 3) {
-            if (config.debugMode) logger.info(`[群组邀请] 用户 ${session.userId} 权限 ${userData.authority}>3`);
+          const auth = (await ctx.database.getUser(session.platform, session.userId, ['authority']).catch(() => null))?.authority ?? 0;
+          if (auth > 3) {
+            if (config.debugMode) logger.info(`[群组邀请] ${session.userId} 权限 ${auth} > 3`);
             verdict = true;
           }
         }
         if (verdict !== true && session.onebot && session.guildId) {
           const stats = await session.onebot.getGroupInfo(session.guildId, true).catch(() => ({})) as GroupStats;
-          const minM = config.minMembers ?? 0;
-          const maxC = config.maxCapacity ?? 0;
-          if (minM > 0 && (stats.member_count ?? 0) < minM) {
-            verdict = `群成员不足 ${minM} 人`;
-            if (config.debugMode) logger.info(`[群组邀请] 群组 ${session.guildId} 成员数 ${stats.member_count ?? 0}<${minM}`);
-          } else if (maxC > 0 && (stats.max_member_count ?? 0) < maxC) {
-            verdict = `群容量不足 ${maxC} 人`;
-            if (config.debugMode) logger.info(`[群组邀请] 群组 ${session.guildId} 受邀容量 ${stats.max_member_count ?? 0}<${maxC}`);
-          } else {
-            verdict = (minM > 0 || maxC > 0);
-            if (config.debugMode && verdict) logger.info(`[群组邀请] 群组 ${session.guildId} 成员数 ${stats.member_count ?? 0}>${minM}，受邀容量 ${stats.max_member_count ?? 0}>${maxC}`);
+          const minPass = (stats.member_count ?? 0) >= (config.minMembers ?? 0);
+          const maxPass = (stats.max_member_count ?? 0) >= (config.maxCapacity ?? 0);
+          if (config.debugMode) {
+            if ((config.minMembers ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 人数 ${stats.member_count ?? 0} ${minPass ? '>' : '<'} "${config.minMembers ?? 0}"`);
+            if ((config.maxCapacity ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 容量 ${stats.max_member_count ?? 0} ${maxPass ? '>' : '<'} "${config.maxCapacity ?? 0}"`);
           }
+          if (!minPass) verdict = `群人数不足 ${config.minMembers ?? 0} 人`;
+          else if (!maxPass) verdict = `群容量不足 ${config.maxCapacity ?? 0} 人`;
+          else verdict = ((config.minMembers ?? 0) > 0 || (config.maxCapacity ?? 0) > 0);
         }
       }
       if (verdict === true) {
@@ -347,6 +329,7 @@ export function apply(ctx: Context, config: Config = {}) {
       finalVerdict = false;
     }
     if (!thresholdMet) return;
+    if (task.timer) clearTimeout(task.timer);
     task.messages.forEach(msg => activeTasks.delete(msg));
     const isSuccess = await executeAction(task.session, task.kind, finalVerdict, finalVerdict ? '' : extraInfo);
     const replyText = isSuccess ? `已${finalVerdict ? '通过' : '拒绝'}该投票` : `处理投票失败`;
@@ -399,17 +382,17 @@ export function apply(ctx: Context, config: Config = {}) {
   });
 
   ctx.on('guild-removed', async (session) => {
-    if (session.event?._data?.sub_type === 'kick_me') {
-      const gid = session.guildId;
-      if (gid) {
-        const inviterId = inviterMap.get(gid);
+    if (session.guildId) {
+      if (session.event?._data?.sub_type === 'kick_me') {
+        const inviterId = inviterMap.get(session.guildId);
         if (inviterId) {
           await session.onebot?.deleteFriend(inviterId).catch(() => {});
-          inviterMap.delete(gid);
+          inviterMap.delete(session.guildId);
           if (config.debugMode) logger.info(`[操作] 删除好友: ${inviterId}`);
         }
-        await session.execute(`analyse.clear -g ${gid}`).catch(() => {});
       }
+      await session.execute(`analyse.clear -g ${session.guildId}`).catch(() => {});
+      if (config.debugMode) logger.info(`[操作] 清理群组数据: ${session.guildId}`);
     }
     await sendNotice(session, 'removed');
   });
