@@ -52,13 +52,12 @@ export interface Config {
   notifyTarget?: string
   debugMode?: boolean
   kickBan?: boolean
-  timeout?: number
-  timeoutAction?: 'accept' | 'reject'
+  friendTimeout: 'manual' | { action: 'accept' | 'reject', timeout: number }
   friendLevel?: number
   friendRegex?: string
   minMembers?: number
   maxCapacity?: number
-  verifyMode?: 'accept' | 'reject' | 'manual'
+  memberTimeout: 'manual' | { action: 'accept' | 'reject', timeout: number }
   verifyRules?: {
     guildId: string;
     keyword?: string;
@@ -82,22 +81,32 @@ export const Config: Schema<Config> = Schema.intersect([
     kickBan: Schema.boolean().description('被踢自动处理').default(false),
   }).description('基础配置'),
   Schema.object({
-    timeout: Schema.number().description('请求超时时长').default(360).min(0),
-    timeoutAction: Schema.union([
-      Schema.const('accept').description('同意'),
-      Schema.const('reject').description('拒绝'),
-    ]).description('默认超时操作').default('accept'),
+    friendTimeout: Schema.union([
+      Schema.const('manual').description('手动'),
+      Schema.object({
+        action: Schema.union([
+          Schema.const('accept').description('同意'),
+          Schema.const('reject').description('拒绝'),
+        ]).description('操作').required(),
+        timeout: Schema.number().description('时长').default(360).min(1),
+      }).description('自动'),
+    ]).description('模式').default('manual'),
     friendLevel: Schema.number().description('最低好友等级').default(0).min(0).max(256),
     friendRegex: Schema.string().description('好友验证正则'),
     minMembers: Schema.number().description('最低群成员数').default(0).min(0).max(3000),
     maxCapacity: Schema.number().description('最低受邀容量').default(0).min(0).max(3000),
   }).description('好友邀群配置'),
   Schema.object({
-    verifyMode: Schema.union([
-      Schema.const('accept').description('同意'),
-      Schema.const('reject').description('拒绝'),
+    memberTimeout: Schema.union([
       Schema.const('manual').description('手动'),
-    ]).description('处理模式').default('manual'),
+      Schema.object({
+        action: Schema.union([
+          Schema.const('accept').description('同意'),
+          Schema.const('reject').description('拒绝'),
+        ]).description('操作').required(),
+        timeout: Schema.number().description('超时').default(360).min(1),
+      }).description('自动'),
+    ]).description('模式').default('manual'),
     verifyRules: Schema.array(Schema.object({
       guildId: Schema.string().description('群号').required(),
       keyword: Schema.string().description('正则'),
@@ -127,7 +136,7 @@ export const Config: Schema<Config> = Schema.intersect([
   }).description('特殊验证配置')
 ])
 
-export function apply(ctx: Context, config: Config = {}) {
+export function apply(ctx: Context, config: Config) {
   const logger = new Logger('onebot-verifier');
   const activeTasks = new Map<string, VerifyTask>();
   const activeCaptchas = new Map<string, CaptchaTask>();
@@ -195,8 +204,7 @@ export function apply(ctx: Context, config: Config = {}) {
   };
 
   const setupManual = async (session: Session, kind: RequestType, specialMode?: 'vote', useInSitu?: boolean) => {
-    const waitMinutes = config.timeout ?? 0;
-    const action = kind === 'member' ? config.verifyMode : config.timeoutAction;
+    const mode = kind === 'member' ? config.memberTimeout : config.friendTimeout;
     let targetStr = config.notifyTarget || '';
     if (useInSitu && kind === 'member' && session.guildId) targetStr = `guild:${session.guildId}`;
     const msgIds = await sendNotice(session, kind, 'waiting', targetStr);
@@ -208,13 +216,13 @@ export function apply(ctx: Context, config: Config = {}) {
       task.votes = { yes: new Set(), no: new Set() };
     }
     msgIds.forEach(id => activeTasks.set(id, task));
-    if (waitMinutes > 0 && (specialMode === 'vote' || action !== 'manual')) {
+    if (mode !== 'manual' && typeof mode === 'object') {
+      const { action, timeout } = mode;
       task.timer = setTimeout(async () => {
         if (!activeTasks.has(msgIds[0])) return;
         msgIds.forEach(id => activeTasks.delete(id));
         let finalAction = action;
-        if (specialMode === 'vote' && finalAction === 'manual') finalAction = 'reject';
-        if (finalAction === 'manual') return;
+        if (specialMode === 'vote') finalAction = 'reject';
         const isPass = finalAction === 'accept';
         await executeAction(session, kind, isPass, isPass ? '' : '等待超时，自动拒绝');
         const [targetType, targetId] = targetStr.split(':');
@@ -223,7 +231,7 @@ export function apply(ctx: Context, config: Config = {}) {
           await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, statusText) : session.bot.sendMessage(targetId, statusText)).catch(() => {});
         }
         if (config.debugMode) logger.info(`[操作] 等待超时，默认${isPass ? '通过' : '拒绝'}`);
-      }, waitMinutes * 60000);
+      }, timeout * 60000);
     }
   };
 
