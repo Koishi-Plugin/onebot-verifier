@@ -269,12 +269,6 @@ export function apply(ctx: Context, config: Config = {}) {
             return;
           }
         }
-        if (config.verifyMode && config.verifyMode !== 'manual') {
-          const isApprove = config.verifyMode === 'accept';
-          await executeAction(session, kind, isApprove, '默认规则，自动处理');
-          await sendNotice(session, kind, isApprove ? 'auto_pass' : 'auto_reject');
-          return;
-        }
         return await setupManual(session, kind);
       }
       let verdict: boolean | string = false;
