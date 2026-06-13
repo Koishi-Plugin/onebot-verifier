@@ -66,7 +66,6 @@ export interface Config {
   }[]
   specialRules?: {
     guildId: string;
-    enabled: boolean;
     mode: 'vote' | 'captcha';
   }[]
   captchaDiff?: 'simple' | 'medium' | 'hard'
@@ -112,7 +111,6 @@ export const Config: Schema<Config> = Schema.intersect([
         Schema.const('vote').description('投票'),
         Schema.const('captcha').description('验证码'),
       ]).description('模式').default('vote'),
-      enabled: Schema.boolean().description('前置规则').default(true),
     })).description('配置列表').role('table'),
     voteRatio: Schema.string().description('[投票]支持/反对人数').default('3:2'),
     voteInSitu: Schema.boolean().description('[投票]对应群中发起').default(true),
@@ -248,7 +246,7 @@ export function apply(ctx: Context, config: Config) {
             }
           }
         }
-        const specialRule = config.specialRules?.find(r => String(r.guildId) === String(session.guildId) && r.enabled);
+        const specialRule = config.specialRules?.find(r => String(r.guildId) === String(session.guildId));
         if (specialRule) {
           if (specialRule.mode === 'vote') return await setupManual(session, kind, 'vote', config.voteInSitu);
           if (specialRule.mode === 'captcha') {
@@ -344,7 +342,7 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.on('guild-member-added', async (session) => {
     if (!config.specialRules || !session.guildId || !session.userId) return;
-    const rule = config.specialRules.find(r => String(r.guildId) === String(session.guildId) && r.enabled);
+    const rule = config.specialRules.find(r => String(r.guildId) === String(session.guildId));
     if (rule?.mode === 'captcha') {
       let a: number, b: number, op: string = '+', answer: string;
       if (config.captchaDiff === 'simple') {
@@ -384,12 +382,18 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.on('guild-removed', async (session) => {
     if (session.guildId) {
-      if (session.event?._data?.sub_type === 'kick_me') {
+      const eventData = session.event?._data || {};
+      if (eventData.sub_type === 'kick_me') {
         const inviterId = inviterMap.get(session.guildId);
         if (inviterId) {
           await session.onebot?.deleteFriend(inviterId).catch(() => {});
           inviterMap.delete(session.guildId);
-          if (config.debugMode) logger.info(`[操作] 删除好友: ${inviterId}`);
+          if (config.debugMode) logger.info(`[操作] 删除邀请者好友: ${inviterId}`);
+        }
+        const adminId = String(eventData.operator_id || session.event?.operator?.id || '');
+        if (adminId && adminId !== inviterId) {
+          await session.onebot?.deleteFriend(adminId).catch(() => {});
+          if (config.debugMode) logger.info(`[操作] 删除管理员好友: ${adminId}`);
         }
       }
       await session.execute(`analyse.clear -g ${session.guildId}`).catch(() => {});
