@@ -58,10 +58,12 @@ export interface Config {
   minMembers?: number
   maxCapacity?: number
   memberTimeout: false | number
+  frequencyMode: 'delay' | 'ignore' | 'reject'
   verifyRules?: {
     guildId: string;
     keyword?: string;
     minLevel?: number;
+    frequency?: number;
     action?: 'accept' | 'reject'
   }[]
   specialRules?: {
@@ -94,10 +96,16 @@ export const Config: Schema<Config> = Schema.intersect([
       Schema.const(false).description('手动'),
       Schema.number().description('自动').default(360),
     ]).description('超时处理').default(false),
+    frequencyMode: Schema.union([
+      Schema.const('delay').description('延时'),
+      Schema.const('ignore').description('忽略'),
+      Schema.const('reject').description('拒绝'),
+    ]).description('频率限制').default('delay'),
     verifyRules: Schema.array(Schema.object({
       guildId: Schema.string().description('群号').required(),
       keyword: Schema.string().description('正则'),
       minLevel: Schema.number().description('等级').default(0),
+      frequency: Schema.number().description('频率').default(0),
       action: Schema.union([
         Schema.const('accept').description('同意'),
         Schema.const('reject').description('拒绝'),
@@ -127,6 +135,7 @@ export function apply(ctx: Context, config: Config) {
   const activeTasks = new Map<string, VerifyTask>();
   const activeCaptchas = new Map<string, CaptchaTask>();
   const inviterMap = new Map<string, string>();
+  const requestMap = new Map<string, number>();
 
   const getComment = (comment?: string) => {
     if (!comment) return '';
@@ -189,7 +198,7 @@ export function apply(ctx: Context, config: Config) {
     }
   };
 
-  const setupManual = async (session: Session, kind: RequestType, specialMode?: 'vote', useInSitu?: boolean) => {
+  const setupManual = async (session: Session, kind: RequestType, specialMode?: 'vote', useInSitu?: boolean, forceTimeoutResult?: boolean) => {
     const timeoutCfg = kind === 'member' ? config.memberTimeout : config.friendTimeout;
     let targetStr = config.notifyTarget || '';
     if (useInSitu && kind === 'member' && session.guildId) targetStr = `guild:${session.guildId}`;
@@ -204,7 +213,7 @@ export function apply(ctx: Context, config: Config) {
     msgIds.forEach(id => activeTasks.set(id, task));
     if (typeof timeoutCfg === 'number') {
       const waitMinutes = Math.abs(timeoutCfg);
-      const isPass = timeoutCfg > 0;
+      const isPass = forceTimeoutResult !== undefined ? forceTimeoutResult : timeoutCfg > 0;
       task.timer = setTimeout(async () => {
         if (!activeTasks.has(msgIds[0])) return;
         msgIds.forEach(id => activeTasks.delete(id));
@@ -239,8 +248,25 @@ export function apply(ctx: Context, config: Config) {
             if (rule.keyword) logger.info(`[加群请求] ${session.userId} 内容 "${verifyText}" ${keywordMatch ? '=' : '≠'} "${rule.keyword}"`);
           }
           if (levelMatch && keywordMatch) {
+            const historyKey = `${session.userId}:${session.guildId}`;
+            const lastTime = requestMap.get(historyKey) || 0;
+            const now = Date.now();
+            const isFrequent = rule.frequency && (now - lastTime) < (rule.frequency * 60000);
+            if (isFrequent) {
+              requestMap.set(historyKey, now);
+              if (config.frequencyMode === 'reject') {
+                await executeAction(session, kind, false, '频繁申请，自动拒绝');
+                await sendNotice(session, kind, 'auto_reject');
+                return;
+              } else if (config.frequencyMode === 'ignore') {
+                return await setupManual(session, kind);
+              } else if (config.frequencyMode === 'delay') {
+                return await setupManual(session, kind, undefined, false, rule.action === 'accept');
+              }
+            }
+            requestMap.set(historyKey, now);
             if (rule.action) {
-              await executeAction(session, kind, rule.action === 'accept', rule.action === 'accept' ? '' : '命中规则，自动拒绝');
+              await executeAction(session, kind, rule.action === 'accept', rule.action === 'accept' ? '' : '错误回答，自动拒绝');
               await sendNotice(session, kind, rule.action === 'accept' ? 'auto_pass' : 'auto_reject');
               return;
             }
