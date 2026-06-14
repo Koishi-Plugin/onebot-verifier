@@ -82,7 +82,7 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     friendTimeout: Schema.union([
       Schema.const(false).description('手动'),
-      Schema.number().description('正数同意/负数拒绝').default(360),
+      Schema.number().description('自动').default(360),
     ]).description('超时处理').default(false),
     friendLevel: Schema.number().description('最低好友等级').default(0).min(0).max(256),
     friendRegex: Schema.string().description('好友验证正则'),
@@ -92,7 +92,7 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     memberTimeout: Schema.union([
       Schema.const(false).description('手动'),
-      Schema.number().description('正数同意/负数拒绝').default(360),
+      Schema.number().description('自动').default(360),
     ]).description('超时处理').default(false),
     verifyRules: Schema.array(Schema.object({
       guildId: Schema.string().description('群号').required(),
@@ -102,24 +102,24 @@ export const Config: Schema<Config> = Schema.intersect([
         Schema.const('accept').description('同意'),
         Schema.const('reject').description('拒绝'),
       ]).description('操作'),
-    })).description('普通验证配置').role('table'),
-  }).description('加群请求配置'),
-  Schema.object({
+    })).description('普通验证').role('table'),
     specialRules: Schema.array(Schema.object({
       guildId: Schema.string().description('群号').required(),
       mode: Schema.union([
         Schema.const('vote').description('投票'),
         Schema.const('captcha').description('验证码'),
       ]).description('模式').default('vote'),
-    })).description('配置列表').role('table'),
+    })).description('高级验证').role('table'),
+  }).description('加群请求配置'),
+  Schema.object({
+    voteInSitu: Schema.boolean().description('[投票]原群投票模式').default(true),
     voteRatio: Schema.string().description('[投票]支持/反对人数').default('3:2'),
-    voteInSitu: Schema.boolean().description('[投票]对应群中发起').default(true),
     captchaDiff: Schema.union([
       Schema.const('simple').description('简单'),
       Schema.const('medium').description('中等'),
       Schema.const('hard').description('困难'),
-    ]).description('[验证]难度').default('simple'),
-  }).description('特殊验证配置')
+    ]).description('[验证]计算难度').default('simple'),
+  }).description('模式配置')
 ])
 
 export function apply(ctx: Context, config: Config) {
@@ -382,6 +382,7 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.on('guild-removed', async (session) => {
     if (session.guildId) {
+      if (config.debugMode) logger.info(`[事件] 退出: ${session.guildId} 数据: ${JSON.stringify(session.event?._data)}`);
       const eventData = session.event?._data || {};
       if (eventData.sub_type === 'kick_me') {
         const inviterId = inviterMap.get(session.guildId);
