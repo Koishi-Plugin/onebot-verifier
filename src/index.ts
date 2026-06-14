@@ -136,6 +136,7 @@ export function apply(ctx: Context, config: Config) {
   const activeCaptchas = new Map<string, CaptchaTask>();
   const inviterMap = new Map<string, string>();
   const requestMap = new Map<string, number>();
+  const recentRemovals = new Map<string, number>();
 
   const getComment = (comment?: string) => {
     if (!comment) return '';
@@ -147,7 +148,7 @@ export function apply(ctx: Context, config: Config) {
   const executeAction = async (session: Session, kind: RequestType, pass: boolean, reason = '', remark = ''): Promise<boolean> => {
     try {
       const eventData = session.event?._data || {};
-      if (config.debugMode) logger.info(`[操作] 类型:${kind} 结果:${pass ? '同意' : '拒绝'} 原因:${reason || '无'}`);
+      if (config.debugMode) logger.info(`[操作] 类型: ${kind} 结果: ${pass ? '同意' : '拒绝'} 原因: ${reason || '无'}`);
       if (pass && kind === 'guild' && session.guildId && session.userId) inviterMap.set(session.guildId, session.userId);
       if (!pass && kind === 'guild' && session.guildId && (session.event?.type === 'guild-added' || eventData.notice_type === 'group_increase')) {
         if (reason) await session.bot?.sendMessage(session.guildId, `${reason}，将退出该群`).catch(() => {});
@@ -236,6 +237,16 @@ export function apply(ctx: Context, config: Config) {
     if (eventData.group_id) session.guildId = String(eventData.group_id);
     try {
       if (config.debugMode) logger.info(`[请求] 类型: ${kind} 数据: ${JSON.stringify(eventData)}`);
+      const curTime = eventData.time || 0;
+      for (const task of activeTasks.values()) {
+        const o = task.session.event?._data || {};
+        if (Math.abs(curTime - (o.time || 0)) < 300) {
+          if (task.kind === kind && o.self_id === eventData.self_id && o.user_id === eventData.user_id && o.group_id === eventData.group_id && o.comment === eventData.comment) {
+            task.session = session;
+            return;
+          }
+        }
+      }
       const verifyText = getComment(eventData.comment);
       if (kind === 'member') {
         const rules = config.verifyRules?.filter(r => String(r.guildId) === String(session.guildId)) || [];
@@ -244,7 +255,7 @@ export function apply(ctx: Context, config: Config) {
           const levelMatch = (stats?.qqLevel ?? 0) >= (rule.minLevel ?? 0);
           const keywordMatch = !rule.keyword || new RegExp(rule.keyword, 'i').test(verifyText);
           if (config.debugMode) {
-            if ((rule.minLevel ?? 0) > 0) logger.info(`[加群请求] ${session.userId} 等级 ${stats?.qqLevel ?? 0} ${levelMatch ? '>' : '<'} "${rule.minLevel ?? 0}"`);
+            if ((rule.minLevel ?? 0) > 0) logger.info(`[加群请求] ${session.userId} 等级 ${stats?.qqLevel ?? 0} ${levelMatch ? '>' : '<'} ${rule.minLevel ?? 0}`);
             if (rule.keyword) logger.info(`[加群请求] ${session.userId} 内容 "${verifyText}" ${keywordMatch ? '=' : '≠'} "${rule.keyword}"`);
           }
           if (levelMatch && keywordMatch) {
@@ -289,7 +300,7 @@ export function apply(ctx: Context, config: Config) {
         if (config.friendLevel && config.friendLevel > 0 && session.onebot && session.userId) {
           const stats = await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats;
           levelPass = (stats.qqLevel ?? 0) >= config.friendLevel;
-          if (config.debugMode) logger.info(`[好友验证] ${session.userId} 等级 ${stats.qqLevel ?? 0} ${levelPass ? '>' : '<'} "${config.friendLevel}"`);
+          if (config.debugMode) logger.info(`[好友验证] ${session.userId} 等级 ${stats.qqLevel ?? 0} ${levelPass ? '>' : '<'} ${config.friendLevel}`);
         }
         if (config.friendRegex) {
           regexPass = new RegExp(config.friendRegex, 'i').test(verifyText);
@@ -310,8 +321,8 @@ export function apply(ctx: Context, config: Config) {
           const minPass = (stats.member_count ?? 0) >= (config.minMembers ?? 0);
           const maxPass = (stats.max_member_count ?? 0) >= (config.maxCapacity ?? 0);
           if (config.debugMode) {
-            if ((config.minMembers ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 人数 ${stats.member_count ?? 0} ${minPass ? '>' : '<'} "${config.minMembers ?? 0}"`);
-            if ((config.maxCapacity ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 容量 ${stats.max_member_count ?? 0} ${maxPass ? '>' : '<'} "${config.maxCapacity ?? 0}"`);
+            if ((config.minMembers ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 人数 ${stats.member_count ?? 0} ${minPass ? '>' : '<'} ${config.minMembers ?? 0}`);
+            if ((config.maxCapacity ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 容量 ${stats.max_member_count ?? 0} ${maxPass ? '>' : '<'} ${config.maxCapacity ?? 0}`);
           }
           if (!minPass) verdict = `群人数不足 ${config.minMembers ?? 0} 人`;
           else if (!maxPass) verdict = `群容量不足 ${config.maxCapacity ?? 0} 人`;
@@ -408,8 +419,11 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.on('guild-removed', async (session) => {
     if (session.guildId) {
-      if (config.debugMode) logger.info(`[事件] 退出: ${session.guildId} 数据: ${JSON.stringify(session.event?._data)}`);
       const eventData = session.event?._data || {};
+      const curTime = eventData.time || 0;
+      if (Math.abs(curTime - (recentRemovals.get(session.guildId) || 0)) < 300) return;
+      recentRemovals.set(session.guildId, curTime);
+      if (config.debugMode) logger.info(`[事件] 退出: ${session.guildId} 数据: ${JSON.stringify(eventData)}`);
       if (eventData.sub_type === 'kick_me') {
         const inviterId = inviterMap.get(session.guildId);
         if (inviterId) {
@@ -425,8 +439,8 @@ export function apply(ctx: Context, config: Config) {
       }
       await session.execute(`analyse.clear -g ${session.guildId}`).catch(() => {});
       if (config.debugMode) logger.info(`[操作] 清理群组数据: ${session.guildId}`);
+      await sendNotice(session, 'removed');
     }
-    await sendNotice(session, 'removed');
   });
 
   ctx.middleware(async (session, next) => {
