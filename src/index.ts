@@ -135,8 +135,7 @@ export function apply(ctx: Context, config: Config) {
   const activeTasks = new Map<string, VerifyTask>();
   const activeCaptchas = new Map<string, CaptchaTask>();
   const inviterMap = new Map<string, string>();
-  const requestMap = new Map<string, number>();
-  const recentRemovals = new Map<string, number>();
+  const historyMap = new Map<string, number>();
 
   const getComment = (comment?: string) => {
     if (!comment) return '';
@@ -249,7 +248,7 @@ export function apply(ctx: Context, config: Config) {
       }
       const verifyText = getComment(eventData.comment);
       if (kind === 'member') {
-        const rules = config.verifyRules?.filter(r => String(r.guildId) === String(session.guildId)) || [];
+        const rules = config.verifyRules?.filter(r => r.guildId === session.guildId) || [];
         for (const rule of rules) {
           const stats = ((rule.minLevel ?? 0) > 0 && session.onebot && session.userId) ? await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats : null;
           const levelMatch = (stats?.qqLevel ?? 0) >= (rule.minLevel ?? 0);
@@ -259,12 +258,9 @@ export function apply(ctx: Context, config: Config) {
             if (rule.keyword) logger.info(`[加群请求] ${session.userId} 内容 "${verifyText}" ${keywordMatch ? '=' : '≠'} "${rule.keyword}"`);
           }
           if (levelMatch && keywordMatch) {
-            const historyKey = `${session.userId}:${session.guildId}`;
-            const lastTime = requestMap.get(historyKey) || 0;
-            const now = Date.now();
-            const isFrequent = rule.frequency && (now - lastTime) < (rule.frequency * 60000);
+            const lastLeaveTime = historyMap.get(`${session.userId}:${session.guildId}`) || 0;
+            const isFrequent = rule.frequency && (Date.now() - lastLeaveTime) < (rule.frequency * 60000);
             if (isFrequent) {
-              requestMap.set(historyKey, now);
               if (config.frequencyMode === 'reject') {
                 await executeAction(session, kind, false, '频繁申请，自动拒绝');
                 await sendNotice(session, kind, 'auto_reject');
@@ -275,7 +271,6 @@ export function apply(ctx: Context, config: Config) {
                 return await setupManual(session, kind, undefined, false, rule.action === 'accept');
               }
             }
-            requestMap.set(historyKey, now);
             if (rule.action) {
               await executeAction(session, kind, rule.action === 'accept', rule.action === 'accept' ? '' : '错误回答，自动拒绝');
               await sendNotice(session, kind, rule.action === 'accept' ? 'auto_pass' : 'auto_reject');
@@ -283,7 +278,7 @@ export function apply(ctx: Context, config: Config) {
             }
           }
         }
-        const specialRule = config.specialRules?.find(r => String(r.guildId) === String(session.guildId));
+        const specialRule = config.specialRules?.find(r => r.guildId === session.guildId);
         if (specialRule) {
           if (specialRule.mode === 'vote') return await setupManual(session, kind, 'vote', config.voteInSitu);
           if (specialRule.mode === 'captcha') {
@@ -377,9 +372,14 @@ export function apply(ctx: Context, config: Config) {
   ctx.on('guild-member-request', hookEvent('member'));
   ctx.on('guild-added', hookEvent('guild'));
 
+  ctx.on('guild-member-removed', async (session) => {
+    if (!session.guildId || !session.userId) return;
+    if (config.verifyRules?.some(r => r.guildId === session.guildId)) historyMap.set(`${session.userId}:${session.guildId}`, Date.now());
+  });
+
   ctx.on('guild-member-added', async (session) => {
     if (!config.specialRules || !session.guildId || !session.userId) return;
-    const rule = config.specialRules.find(r => String(r.guildId) === String(session.guildId));
+    const rule = config.specialRules.find(r => r.guildId === session.guildId);
     if (rule?.mode === 'captcha') {
       let a: number, b: number, op: string = '+', answer: string;
       if (config.captchaDiff === 'simple') {
@@ -404,16 +404,15 @@ export function apply(ctx: Context, config: Config) {
         op = '×';
         answer = (a * b).toString();
       }
-      const captchaKey = `${session.guildId}:${session.userId}`;
       await session.send(`<at id="${session.userId}"/> 请在 60 秒内回复计算结果，以进行验证：${a} ${op} ${b} =`);
       const timer = setTimeout(async () => {
-        if (activeCaptchas.has(captchaKey)) {
-          activeCaptchas.delete(captchaKey);
+        if (activeCaptchas.has(`${session.userId}:${session.guildId}`)) {
+          activeCaptchas.delete(`${session.userId}:${session.guildId}`);
           await session.send(`<at id="${session.userId}"/> 验证失败，将被移出本群。`);
           await session.onebot?.setGroupKick(session.guildId!, session.userId!, false);
         }
       }, 60000);
-      activeCaptchas.set(captchaKey, { guildId: session.guildId, userId: session.userId, answer, timer });
+      activeCaptchas.set(`${session.userId}:${session.guildId}`, { guildId: session.guildId, userId: session.userId, answer, timer });
     }
   });
 
@@ -421,8 +420,8 @@ export function apply(ctx: Context, config: Config) {
     if (session.guildId) {
       const eventData = session.event?._data || {};
       const curTime = eventData.time || 0;
-      if (Math.abs(curTime - (recentRemovals.get(session.guildId) || 0)) < 300) return;
-      recentRemovals.set(session.guildId, curTime);
+      if (Math.abs(curTime - (historyMap.get(session.guildId) || 0)) < 300) return;
+      historyMap.set(session.guildId, curTime);
       if (config.debugMode) logger.info(`[事件] 退出: ${session.guildId} 数据: ${JSON.stringify(eventData)}`);
       if (eventData.sub_type === 'kick_me') {
         const inviterId = inviterMap.get(session.guildId);
@@ -446,39 +445,29 @@ export function apply(ctx: Context, config: Config) {
   ctx.middleware(async (session, next) => {
     if (typeof session.content !== 'string') return next();
     if (session.guildId && session.userId) {
-      const captchaKey = `${session.guildId}:${session.userId}`;
-      const captcha = activeCaptchas.get(captchaKey);
-      if (captcha) {
-        const input = session.content.trim();
-        if (input === captcha.answer) {
-          clearTimeout(captcha.timer);
-          activeCaptchas.delete(captchaKey);
-          await session.send(`<at id="${session.userId}"/> 验证成功，欢迎加入本群！`);
-          return;
-        }
+      const captcha = activeCaptchas.get(`${session.userId}:${session.guildId}`);
+      if (captcha && session.content.trim() === captcha.answer) {
+        clearTimeout(captcha.timer);
+        activeCaptchas.delete(`${session.userId}:${session.guildId}`);
+        await session.send(`<at id="${session.userId}"/> 验证成功，欢迎加入本群！`);
+        return;
       }
     }
     if (!session.quote?.id) return next();
     const task = activeTasks.get(session.quote.id);
     if (!task) return next();
     const [ntType, ntId] = (config.notifyTarget || '').split(':');
-    const isGlobalNotifyTarget = ntType === 'private' ? (session.userId === ntId) : (session.guildId === ntId);
-    const isInSituGuild = task.inSitu && session.guildId && session.guildId === task.session.guildId;
-    if (!isGlobalNotifyTarget && !isInSituGuild) return next();
+    if ((ntType === 'private' ? session.userId !== ntId : session.guildId !== ntId) && !(task.inSitu && session.guildId === task.session.guildId)) return next();
     const input = session.content.replace(/<(quote|at)\s+[^>]*\/>/gi, '').trim();
     const cmdMatch = input.match(/^(y|n|通过|拒绝)(?:\s+(.*))?$/i);
     if (!cmdMatch) return next();
     const isApprove = ['y', '通过'].includes(cmdMatch[1].toLowerCase());
     const extraInfo = cmdMatch[2]?.trim() || '';
     if (config.debugMode) logger.info(`[操作] 收到指令: ${isApprove ? '同意' : '拒绝'}`);
-    if (task.specialMode === 'vote') {
-      await handleSpecialVote(session, task, isApprove, extraInfo);
-      return;
-    }
+    if (task.specialMode === 'vote') return await handleSpecialVote(session, task, isApprove, extraInfo);
     if (task.timer) clearTimeout(task.timer);
     task.messages.forEach(msg => activeTasks.delete(msg));
     const isSuccess = await executeAction(task.session, task.kind, isApprove, isApprove ? '' : extraInfo, (isApprove && task.kind === 'friend') ? extraInfo : '');
-    const replyText = isSuccess ? `已${isApprove ? '通过' : '拒绝'}该请求` : `处理请求失败`;
-    await session.send(replyText).catch(() => {});
+    await session.send(isSuccess ? `已${isApprove ? '通过' : '拒绝'}该请求` : `处理请求失败`).catch(() => {});
   });
 }
