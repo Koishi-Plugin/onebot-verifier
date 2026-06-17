@@ -121,7 +121,7 @@ export const Config: Schema<Config> = Schema.intersect([
   }).description('加群请求配置'),
   Schema.object({
     voteInSitu: Schema.boolean().description('[投票]原群投票模式').default(true),
-    voteRatio: Schema.string().description('[投票]支持/反对人数').default('3:2'),
+    voteRatio: Schema.string().description('[投票]支持/反对人数').default('5:1'),
     captchaDiff: Schema.union([
       Schema.const('simple').description('简单'),
       Schema.const('medium').description('中等'),
@@ -169,7 +169,7 @@ export function apply(ctx: Context, config: Config) {
     }
   };
 
-  const sendNotice = async (session: Session, kind: RequestType, status: 'auto_pass' | 'auto_reject' | 'waiting' = 'waiting', overrideTarget?: string): Promise<string[]> => {
+  const sendNotice = async (session: Session, kind: RequestType, status: 'auto_pass' | 'auto_reject' | 'waiting' = 'waiting', overrideTarget?: string, specialMode?: 'vote'): Promise<string[]> => {
     const notifyConfig = overrideTarget || config.notifyTarget || '';
     const [targetType, targetId] = notifyConfig.split(':');
     if (!targetId || !session.bot) return [];
@@ -188,7 +188,10 @@ export function apply(ctx: Context, config: Config) {
       if (adminId) infoLines.push(`管理：${adminInfo?.name ? `${adminInfo.name}(${adminId})` : adminId}`);
       if (session.guildId) infoLines.push(`群组：${groupInfo?.name ? `${groupInfo.name}(${session.guildId})` : session.guildId}`);
       if (eventData.comment) infoLines.push(`验证信息：${eventData.comment}`);
-      if (status === 'waiting' && kind !== 'removed') infoLines.push(`回复"y/n"以同意/拒绝该请求`);
+      if (status === 'waiting' && kind !== 'removed') {
+        if (specialMode === 'vote') infoLines.push(`[投票模式]需${(config.voteRatio!).split(':')[0]}人同意或${(config.voteRatio!).split(':')[1]}人拒绝`);
+        infoLines.push(`使用"y/n"回复本消息以处理该请求`);
+      }
       const content = infoLines.join('\n');
       const msgIds = await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, content) : session.bot.sendMessage(targetId, content)) || [];
       return msgIds;
@@ -202,7 +205,7 @@ export function apply(ctx: Context, config: Config) {
     const timeoutCfg = kind === 'member' ? config.memberTimeout : config.friendTimeout;
     let targetStr = config.notifyTarget || '';
     if (useInSitu && kind === 'member' && session.guildId) targetStr = `guild:${session.guildId}`;
-    const msgIds = await sendNotice(session, kind, 'waiting', targetStr);
+    const msgIds = await sendNotice(session, kind, 'waiting', targetStr, specialMode);
     if (!msgIds?.length) return;
     const task: VerifyTask = { session, kind, messages: msgIds, specialMode, inSitu: useInSitu };
     if (specialMode === 'vote') {
@@ -363,8 +366,7 @@ export function apply(ctx: Context, config: Config) {
     if (task.timer) clearTimeout(task.timer);
     task.messages.forEach(msg => activeTasks.delete(msg));
     const isSuccess = await executeAction(task.session, task.kind, finalVerdict, finalVerdict ? '' : extraInfo);
-    const replyText = isSuccess ? `已${finalVerdict ? '通过' : '拒绝'}该投票` : `处理投票失败`;
-    await session.send(replyText).catch(() => {});
+    if (!task.inSitu) await session.send(isSuccess ? `已${finalVerdict ? '通过' : '拒绝'}该投票` : `处理投票失败`).catch(() => {});
   };
 
   ctx.on('friend-request', hookEvent('friend'));
