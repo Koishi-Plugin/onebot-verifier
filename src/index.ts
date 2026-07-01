@@ -121,7 +121,7 @@ export const Config: Schema<Config> = Schema.intersect([
   }).description('加群请求配置'),
   Schema.object({
     voteInSitu: Schema.boolean().description('[投票]原群投票模式').default(true),
-    voteRatio: Schema.string().description('[投票]支持/反对人数').default('5:1'),
+    voteRatio: Schema.string().description('[投票]支持/反对人数').default('5:2'),
     captchaDiff: Schema.union([
       Schema.const('simple').description('简单'),
       Schema.const('medium').description('中等'),
