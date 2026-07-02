@@ -149,6 +149,10 @@ export function apply(ctx: Context, config: Config) {
       const eventData = session.event?._data || {};
       if (config.debugMode) logger.info(`[操作] 类型: ${kind} 结果: ${pass ? '同意' : '拒绝'} 原因: ${reason || '无'}`);
       if (pass && kind === 'guild' && session.guildId && session.userId) inviterMap.set(session.guildId, session.userId);
+      if (!pass && kind === 'guild' && session.userId && session.bot) {
+        const rejectMsg = `已拒绝该群组邀请${reason ? `，原因：${reason}` : ''}`;
+        await session.bot.sendPrivateMessage(session.userId, rejectMsg).catch(() => {});
+      }
       if (!pass && kind === 'guild' && session.guildId && (session.event?.type === 'guild-added' || eventData.notice_type === 'group_increase')) {
         if (reason) await session.bot?.sendMessage(session.guildId, `${reason}，将退出该群`).catch(() => {});
         await session.onebot?.setGroupLeave(session.guildId, false);
@@ -179,7 +183,7 @@ export function apply(ctx: Context, config: Config) {
       const groupInfo = (kind !== 'friend' && session.guildId) ? await session.bot.getGuild?.(session.guildId).catch(() => null) : null;
       const adminId = String(eventData.operator_id || session.event?.operator?.id || '');
       const adminInfo = (adminId && adminId !== session.userId) ? await session.bot.getUser?.(adminId).catch(() => null) : null;
-      const typeMap = { friend: '好友申请', member: '加群请求', guild: eventData.post_type === 'notice' ? '群组邀请 [通过]' : '群组邀请 [请求]', removed: eventData.sub_type === 'kick_me' ? '移出群组' : '退出群组' };
+      const typeMap = { friend: '好友申请', member: '加群请求', guild: eventData.post_type === 'notice' ? '群组邀请 (通过)' : '群组邀请 (请求)', removed: eventData.sub_type === 'kick_me' ? '移出群组' : '退出群组' };
       const statusMap = { auto_pass: ' [自动通过]', auto_reject: ' [自动拒绝]', waiting: ' [等待处理]' };
       const infoLines = [];
       if (userInfo?.avatar) infoLines.push(`<image url="${userInfo.avatar}"/>`);
