@@ -179,7 +179,7 @@ export function apply(ctx: Context, config: Config) {
       const groupInfo = (kind !== 'friend' && session.guildId) ? await session.bot.getGuild?.(session.guildId).catch(() => null) : null;
       const adminId = String(eventData.operator_id || session.event?.operator?.id || '');
       const adminInfo = (adminId && adminId !== session.userId) ? await session.bot.getUser?.(adminId).catch(() => null) : null;
-      const typeMap = { friend: '好友申请', member: '加群请求', guild: '群组邀请', removed: eventData.sub_type === 'kick_me' ? '移出群组' : '退出群组' };
+      const typeMap = { friend: '好友申请', member: '加群请求', guild: eventData.post_type === 'notice' ? '群组邀请 [通过]' : '群组邀请 [请求]', removed: eventData.sub_type === 'kick_me' ? '移出群组' : '退出群组' };
       const statusMap = { auto_pass: ' [自动通过]', auto_reject: ' [自动拒绝]', waiting: ' [等待处理]' };
       const infoLines = [];
       if (userInfo?.avatar) infoLines.push(`<image url="${userInfo.avatar}"/>`);
@@ -239,15 +239,23 @@ export function apply(ctx: Context, config: Config) {
     if (eventData.group_id) session.guildId = String(eventData.group_id);
     try {
       if (config.debugMode) logger.info(`[请求] 类型: ${kind} 数据: ${JSON.stringify(eventData)}`);
-      const curTime = eventData.time || 0;
-      for (const task of activeTasks.values()) {
-        const o = task.session.event?._data || {};
-        if (Math.abs(curTime - (o.time || 0)) < 300) {
-          if (task.kind === kind && o.self_id === eventData.self_id && o.user_id === eventData.user_id && o.group_id === eventData.group_id && o.comment === eventData.comment) {
+      if (kind === 'friend') {
+        const flag = eventData.flag || `${session.userId}:${eventData.time}`;
+        const now = Date.now();
+        const flagKey = `flag:${flag}`;
+        if (historyMap.has(flagKey) && now - historyMap.get(flagKey)! < 30000) return;
+        historyMap.set(flagKey, now);
+        let updatedPending = false;
+        for (const task of new Set(activeTasks.values())) {
+          if (task.kind === 'friend' && task.session.userId === session.userId) {
             task.session = session;
-            return;
+            updatedPending = true;
           }
         }
+        if (updatedPending) return;
+        const userKey = `friend:${session.userId}`;
+        if (historyMap.has(userKey) && now - historyMap.get(userKey)! < 30000) return;
+        historyMap.set(userKey, now);
       }
       const verifyText = getComment(eventData.comment);
       if (kind === 'member') {
@@ -421,9 +429,6 @@ export function apply(ctx: Context, config: Config) {
   ctx.on('guild-removed', async (session) => {
     if (session.guildId) {
       const eventData = session.event?._data || {};
-      const curTime = eventData.time || 0;
-      if (Math.abs(curTime - (historyMap.get(session.guildId) || 0)) < 300) return;
-      historyMap.set(session.guildId, curTime);
       if (config.debugMode) logger.info(`[事件] 退出: ${session.guildId} 数据: ${JSON.stringify(eventData)}`);
       if (eventData.sub_type === 'kick_me') {
         const inviterId = inviterMap.get(session.guildId);
