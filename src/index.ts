@@ -52,6 +52,7 @@ export interface Config {
   notifyTarget?: string
   debugMode?: boolean
   kickBan?: boolean
+  blacklist?: string[]
   friendTimeout: false | number
   friendLevel?: number
   friendRegex?: string
@@ -80,6 +81,7 @@ export const Config: Schema<Config> = Schema.intersect([
     notifyTarget: Schema.string().description('通知目标(guild/private:number)').required(),
     debugMode: Schema.boolean().description('输出调试日志').default(false),
     kickBan: Schema.boolean().description('被踢自动处理').default(false),
+    blacklist: Schema.array(Schema.string()).description('群组黑名单').role('table'),
   }).description('基础配置'),
   Schema.object({
     friendTimeout: Schema.union([
@@ -244,6 +246,7 @@ export function apply(ctx: Context, config: Config) {
     const eventData = session.event?._data || {};
     if (eventData.user_id) session.userId = String(eventData.user_id);
     if (eventData.group_id) session.guildId = String(eventData.group_id);
+    if (session.guildId && config.blacklist?.includes(session.guildId)) return;
     try {
       if (config.debugMode) logger.info(`[请求] 类型: ${kind} 数据: ${JSON.stringify(eventData)}`);
       if (kind === 'friend') {
@@ -390,12 +393,12 @@ export function apply(ctx: Context, config: Config) {
   ctx.on('guild-added', hookEvent('guild'));
 
   ctx.on('guild-member-removed', async (session) => {
-    if (!session.guildId || !session.userId) return;
+    if (!session.guildId || !session.userId || config.blacklist?.includes(session.guildId)) return;
     if (config.verifyRules?.some(r => r.guildId === session.guildId)) historyMap.set(`${session.userId}:${session.guildId}`, Date.now());
   });
 
   ctx.on('guild-member-added', async (session) => {
-    if (!config.specialRules || !session.guildId || !session.userId) return;
+    if (!config.specialRules || !session.guildId || !session.userId || config.blacklist?.includes(session.guildId)) return;
     const rule = config.specialRules.find(r => r.guildId === session.guildId);
     if (rule?.mode === 'captcha') {
       let a: number, b: number, op: string = '+', answer: string;
@@ -435,6 +438,7 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.on('guild-removed', async (session) => {
     if (session.guildId) {
+      if (config.blacklist?.includes(session.guildId)) return;
       const eventData = session.event?._data || {};
       if (config.debugMode) logger.info(`[事件] 退出: ${session.guildId} 数据: ${JSON.stringify(eventData)}`);
       if (eventData.sub_type === 'kick_me') {

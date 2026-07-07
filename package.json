@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-onebot-verifier",
   "description": "[仅支持 Onebot 平台]支持好友申请/群组邀请/加群请求等的自动审核，可根据等级与正则进行筛选，并有入群验证码、投票表决、被踢清理等功能。",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "contributors": [
     "Yis_Rime <yis_rime@outlook.com>"
   ],
