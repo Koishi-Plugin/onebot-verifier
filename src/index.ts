@@ -196,7 +196,9 @@ export function apply(ctx: Context, config: Config) {
       if ((kind !== 'guild' && kind !== 'removed') || (session.userId && session.userId !== session.selfId)) infoLines.push(`用户：${userInfo?.name || session.userId}${session.userId ? `(${session.userId})` : ''}`);
       if (adminId) infoLines.push(`管理：${adminInfo?.name ? `${adminInfo.name}(${adminId})` : adminId}`);
       if (session.guildId) infoLines.push(`群组：${groupInfo?.name ? `${groupInfo.name}(${session.guildId})` : session.guildId}`);
+      if (eventData.invitor_id && String(eventData.invitor_id) !== '0') infoLines.push(`邀请者：${eventData.invitor_id}`);
       if (eventData.comment) infoLines.push(`验证信息：${eventData.comment}`);
+      if (eventData.via) infoLines.push(`来源：${eventData.via}`);
       if (status === 'waiting' && kind !== 'removed') {
         if (specialMode === 'vote') infoLines.push(`[投票模式]需${(config.voteRatio!).split(':')[0]}人同意或${(config.voteRatio!).split(':')[1]}人拒绝`);
         infoLines.push(`使用"y/n"回复本消息以处理该请求`);
@@ -249,25 +251,33 @@ export function apply(ctx: Context, config: Config) {
     if (session.guildId && config.blacklist?.includes(session.guildId)) return;
     try {
       if (config.debugMode) logger.info(`[请求] 类型: ${kind} 数据: ${JSON.stringify(eventData)}`);
-      if (kind === 'friend') {
-        const flag = eventData.flag || `${session.userId}:${eventData.time}`;
-        const now = Date.now();
-        const flagKey = `flag:${flag}`;
-        if (historyMap.has(flagKey) && now - historyMap.get(flagKey)! < 30000) return;
-        historyMap.set(flagKey, now);
-        let updatedPending = false;
-        for (const task of new Set(activeTasks.values())) {
-          if (task.kind === 'friend' && task.session.userId === session.userId) {
-            task.session = session;
-            updatedPending = true;
-          }
-        }
-        if (updatedPending) return;
-        const userKey = `friend:${session.userId}`;
-        if (historyMap.has(userKey) && now - historyMap.get(userKey)! < 30000) return;
-        historyMap.set(userKey, now);
-      }
       const verifyText = getComment(eventData.comment);
+      if (kind === 'friend') {
+        const existingTask = [...activeTasks.values()].find(t => t.kind === 'friend' && t.session.userId === session.userId);
+        if (existingTask) {
+          if (existingTask.timer) clearTimeout(existingTask.timer);
+          const oldVerifyText = getComment(existingTask.session.event?._data?.comment);
+          if (oldVerifyText === verifyText) {
+            existingTask.session = session;
+            const timeoutCfg = config.friendTimeout;
+            if (typeof timeoutCfg === 'number') {
+              const isPass = timeoutCfg > 0;
+              existingTask.timer = setTimeout(async () => {
+                if (!activeTasks.has(existingTask.messages[0])) return;
+                existingTask.messages.forEach(id => activeTasks.delete(id));
+                await executeAction(session, 'friend', isPass, isPass ? '' : '等待超时，自动拒绝');
+                const [targetType, targetId] = (config.notifyTarget || '').split(':');
+                if (targetId && session.bot) {
+                  const statusText = `已自动${isPass ? '通过' : '拒绝'}该请求`;
+                  await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, statusText) : session.bot.sendMessage(targetId, statusText)).catch(() => {});
+                }
+              }, Math.abs(timeoutCfg) * 60000);
+            }
+            return;
+          }
+          existingTask.messages.forEach(id => activeTasks.delete(id));
+        }
+      }
       if (kind === 'member') {
         const rules = config.verifyRules?.filter(r => r.guildId === session.guildId) || [];
         for (const rule of rules) {
