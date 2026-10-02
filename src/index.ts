@@ -248,9 +248,11 @@ export function apply(ctx: Context, config: Config) {
     const eventData = session.event?._data || {};
     if (eventData.user_id) session.userId = String(eventData.user_id);
     if (eventData.group_id) session.guildId = String(eventData.group_id);
+    const isApply = kind === 'guild' && eventData.post_type === 'request' && !!eventData.invited_id && String(eventData.invited_id) !== String(eventData.self_id);
+    if (isApply) session.userId = String(eventData.invited_id);
     if (session.guildId && config.blacklist?.includes(session.guildId)) return;
     try {
-      if (config.debugMode) logger.info(`[请求] 类型: ${kind} 数据: ${JSON.stringify(eventData)}`);
+      if (config.debugMode) logger.info(`[请求] 类型: ${isApply ? 'member' : kind} 数据: ${JSON.stringify(eventData)}`);
       const verifyText = getComment(eventData.comment);
       if (kind === 'friend') {
         const existingTask = [...activeTasks.values()].find(t => t.kind === 'friend' && t.session.userId === session.userId);
@@ -278,7 +280,7 @@ export function apply(ctx: Context, config: Config) {
           existingTask.messages.forEach(id => activeTasks.delete(id));
         }
       }
-      if (kind === 'member') {
+      if (isApply || kind === 'member') {
         const rules = config.verifyRules?.filter(r => r.guildId === session.guildId) || [];
         for (const rule of rules) {
           const stats = ((rule.minLevel ?? 0) > 0 && session.onebot && session.userId) ? await session.onebot.getStrangerInfo(session.userId, true).catch(() => ({})) as UserStats : null;
@@ -293,32 +295,32 @@ export function apply(ctx: Context, config: Config) {
             const isFrequent = rule.frequency && (Date.now() - lastLeaveTime) < (rule.frequency * 60000);
             if (isFrequent) {
               if (config.frequencyMode === 'reject') {
-                await executeAction(session, kind, false, '频繁申请，自动拒绝');
-                await sendNotice(session, kind, 'auto_reject');
+                await executeAction(session, isApply ? 'member' : kind, false, '频繁申请，自动拒绝');
+                await sendNotice(session, isApply ? 'member' : kind, 'auto_reject');
                 return;
               } else if (config.frequencyMode === 'ignore') {
-                return await setupManual(session, kind);
+                return await setupManual(session, isApply ? 'member' : kind);
               } else if (config.frequencyMode === 'delay') {
-                return await setupManual(session, kind, undefined, false, rule.action === 'accept');
+                return await setupManual(session, isApply ? 'member' : kind, undefined, false, rule.action === 'accept');
               }
             }
             if (rule.action) {
-              await executeAction(session, kind, rule.action === 'accept', rule.action === 'accept' ? '' : '错误回答，自动拒绝');
-              await sendNotice(session, kind, rule.action === 'accept' ? 'auto_pass' : 'auto_reject');
+              await executeAction(session, isApply ? 'member' : kind, rule.action === 'accept', rule.action === 'accept' ? '' : '错误回答，自动拒绝');
+              await sendNotice(session, isApply ? 'member' : kind, rule.action === 'accept' ? 'auto_pass' : 'auto_reject');
               return;
             }
           }
         }
         const specialRule = config.specialRules?.find(r => r.guildId === session.guildId);
         if (specialRule) {
-          if (specialRule.mode === 'vote') return await setupManual(session, kind, 'vote', config.voteInSitu);
+          if (specialRule.mode === 'vote') return await setupManual(session, isApply ? 'member' : kind, 'vote', config.voteInSitu);
           if (specialRule.mode === 'captcha') {
-            await executeAction(session, kind, true, '验证码验证，自动通过');
-            await sendNotice(session, kind, 'auto_pass');
+            await executeAction(session, isApply ? 'member' : kind, true, '验证码验证，自动通过');
+            await sendNotice(session, isApply ? 'member' : kind, 'auto_pass');
             return;
           }
         }
-        return await setupManual(session, kind);
+        return await setupManual(session, isApply ? 'member' : kind);
       }
       let verdict: boolean | string = false;
       if (kind === 'friend') {
