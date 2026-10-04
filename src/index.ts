@@ -344,17 +344,23 @@ export function apply(ctx: Context, config: Config) {
             verdict = true;
           }
         }
-        if (verdict !== true && session.onebot && session.guildId) {
-          const stats = await session.onebot.getGroupInfo(session.guildId, true).catch(() => ({})) as GroupStats;
-          const minPass = (stats.member_count ?? 0) >= (config.minMembers ?? 0);
-          const maxPass = (stats.max_member_count ?? 0) >= (config.maxCapacity ?? 0);
+        if (verdict !== true && session.onebot && session.guildId && ((config.minMembers ?? 0) > 0 || (config.maxCapacity ?? 0) > 0)) {
+          let stats = await session.onebot.getGroupInfo(session.guildId, true).catch(() => ({})) as GroupStats;
+          if (!stats.member_count) stats = await (session.onebot as any)._get('get_group_detail_info', { group_id: +session.guildId, no_cache: true }).catch(() => ({}));
+          const memberCount = stats.member_count || 0;
+          const capacity = stats.max_member_count || 0;
+          const memberKnown = memberCount > 0;
+          const capacityKnown = (config.maxCapacity ?? 0) <= 0 || capacity > 0;
+          const minPass = memberKnown && memberCount >= (config.minMembers ?? 0);
+          const maxPass = capacityKnown && capacity >= (config.maxCapacity ?? 0);
           if (config.debugMode) {
-            if ((config.minMembers ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 人数 ${stats.member_count ?? 0} ${minPass ? '>' : '<'} ${config.minMembers ?? 0}`);
-            if ((config.maxCapacity ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 容量 ${stats.max_member_count ?? 0} ${maxPass ? '>' : '<'} ${config.maxCapacity ?? 0}`);
+            if ((config.minMembers ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 人数 ${memberKnown ? `${memberCount} ${minPass ? '>' : '<'}` : '未知'} ${config.minMembers ?? 0}`);
+            if ((config.maxCapacity ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 容量 ${capacityKnown ? `${capacity} ${maxPass ? '>' : '<'}` : '未知'} ${config.maxCapacity ?? 0}`);
           }
+          if (!memberKnown || !capacityKnown) return await setupManual(session, kind);
           if (!minPass) verdict = `群人数不足 ${config.minMembers ?? 0} 人`;
           else if (!maxPass) verdict = `群容量不足 ${config.maxCapacity ?? 0} 人`;
-          else verdict = ((config.minMembers ?? 0) > 0 || (config.maxCapacity ?? 0) > 0);
+          else verdict = true;
         }
       }
       if (verdict === true) {
