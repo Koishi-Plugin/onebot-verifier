@@ -147,8 +147,8 @@ export function apply(ctx: Context, config: Config) {
   };
 
   const executeAction = async (session: Session, kind: RequestType, pass: boolean, reason = '', remark = ''): Promise<boolean> => {
+    const eventData = session.event?._data || {};
     try {
-      const eventData = session.event?._data || {};
       if (config.debugMode) logger.info(`[操作] 类型: ${kind} 结果: ${pass ? '同意' : '拒绝'} 原因: ${reason || '无'}`);
       if (pass && kind === 'guild' && session.guildId && session.userId) inviterMap.set(session.guildId, session.userId);
       if (!pass && kind === 'guild' && session.bot) {
@@ -165,7 +165,7 @@ export function apply(ctx: Context, config: Config) {
         return true;
       }
       const flag = eventData.flag;
-      if (!flag || !session.onebot) return false;
+      if (!flag || !session.onebot) throw new Error('无法处理请求');
       if (kind === 'friend') {
         await session.onebot.setFriendAddRequest(flag, pass, remark);
       } else {
@@ -173,7 +173,10 @@ export function apply(ctx: Context, config: Config) {
       }
       return true;
     } catch (error) {
-      logger.error(`操作失败: ${error}`);
+      const label = `${kind}${session.guildId ? ` 群 ${session.guildId}` : ''}${session.userId ? ` 用户 ${session.userId}` : ''}${eventData.flag ? ` flag=${eventData.flag}` : ''}`;
+      logger.error(`操作失败(${label}): ${error}`);
+      const [targetType, targetId] = (config.notifyTarget || '').split(':');
+      if (targetId && session.bot) await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, `⚠️ 处理请求失败(${label})\n原因：${error}`) : session.bot.sendMessage(targetId, `⚠️ 处理请求失败(${label})\n原因：${error}`)).catch(() => {});
       return false;
     }
   };
@@ -244,10 +247,15 @@ export function apply(ctx: Context, config: Config) {
     }
   };
 
-  const hookEvent = (kind: RequestType) => async (session: Session) => {
+  const hookEvent = (defaultKind: RequestType) => async (session: Session) => {
+    let kind = defaultKind;
     const eventData = session.event?._data || {};
     if (eventData.user_id) session.userId = String(eventData.user_id);
     if (eventData.group_id) session.guildId = String(eventData.group_id);
+    if (kind === 'guild' && eventData.post_type === 'request' && eventData.invited_id && String(eventData.invited_id) !== String(eventData.self_id || session.selfId)) {
+      kind = 'member';
+      session.userId = String(eventData.invited_id);
+    }
     if (session.guildId && config.blacklist?.includes(session.guildId)) return;
     try {
       if (config.debugMode) logger.info(`[请求] 类型: ${kind} 数据: ${JSON.stringify(eventData)}`);
@@ -343,13 +351,19 @@ export function apply(ctx: Context, config: Config) {
           }
         }
         if (verdict !== true && session.onebot && session.guildId) {
-          const stats = await session.onebot.getGroupInfo(session.guildId, true).catch(() => ({})) as GroupStats;
-          const minPass = (stats.member_count ?? 0) >= (config.minMembers ?? 0);
-          const maxPass = (stats.max_member_count ?? 0) >= (config.maxCapacity ?? 0);
+          let stats = await session.onebot.getGroupInfo(session.guildId, true).catch(() => ({})) as GroupStats;
+          if (!stats.member_count) stats = await (session.onebot as any)._get('get_group_detail_info', { group_id: +session.guildId, no_cache: true }).catch(() => null) || stats;
+          const memberCount = +(stats.member_count ?? 0);
+          const capacity = +(stats.max_member_count ?? 0);
+          const memberKnown = memberCount > 0;
+          const capacityKnown = (config.maxCapacity ?? 0) <= 0 || capacity > 0;
+          const minPass = memberKnown && memberCount >= (config.minMembers ?? 0);
+          const maxPass = capacityKnown && capacity >= (config.maxCapacity ?? 0);
           if (config.debugMode) {
-            if ((config.minMembers ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 人数 ${stats.member_count ?? 0} ${minPass ? '>' : '<'} ${config.minMembers ?? 0}`);
-            if ((config.maxCapacity ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 容量 ${stats.max_member_count ?? 0} ${maxPass ? '>' : '<'} ${config.maxCapacity ?? 0}`);
+            if ((config.minMembers ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 人数 ${memberKnown ? `${memberCount} ${minPass ? '>' : '<'}` : '?'} ${config.minMembers ?? 0}`);
+            if ((config.maxCapacity ?? 0) > 0) logger.info(`[群组邀请] ${session.guildId} 容量 ${capacityKnown ? `${capacity} ${maxPass ? '>' : '<'}` : '?'} ${config.maxCapacity ?? 0}`);
           }
+          if (!memberKnown || !capacityKnown) return await setupManual(session, kind);
           if (!minPass) verdict = `群人数不足 ${config.minMembers ?? 0} 人`;
           else if (!maxPass) verdict = `群容量不足 ${config.maxCapacity ?? 0} 人`;
           else verdict = ((config.minMembers ?? 0) > 0 || (config.maxCapacity ?? 0) > 0);
