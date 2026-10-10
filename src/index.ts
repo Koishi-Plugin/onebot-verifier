@@ -175,8 +175,6 @@ export function apply(ctx: Context, config: Config) {
     } catch (error) {
       const label = `${kind}${session.guildId ? ` 群 ${session.guildId}` : ''}${session.userId ? ` 用户 ${session.userId}` : ''}${eventData.flag ? ` flag=${eventData.flag}` : ''}`;
       logger.error(`操作失败(${label}): ${error}`);
-      const [targetType, targetId] = (config.notifyTarget || '').split(':');
-      if (targetId && session.bot) await (targetType === 'private' ? session.bot.sendPrivateMessage(targetId, `⚠️ 处理请求失败(${label})\n原因：${error}`) : session.bot.sendMessage(targetId, `⚠️ 处理请求失败(${label})\n原因：${error}`)).catch(() => {});
       return false;
     }
   };
